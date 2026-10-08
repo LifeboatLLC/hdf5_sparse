@@ -25,6 +25,9 @@ typedef struct H5HG_t {
 /* Typedef for heap in memory (defined in H5HGpkg.h) */
 typedef struct H5HG_heap_t H5HG_heap_t;
 
+/* Typedef for heapset in memory (defined in H5HGpkg.h) */
+typedef struct H5HG_local_heapset_t H5HG_local_heapset_t;
+
 /*
  * Limit global heap collections to the some reasonable size.  This is
  * fairly arbitrary, but needs to be small enough that no more than H5HG_MAXIDX
@@ -64,5 +67,38 @@ H5_DLL size_t  H5HG_get_free_size(const H5HG_heap_t *h);
 
 /* Debugging functions */
 H5_DLL herr_t H5HG_debug(H5F_t *f, haddr_t addr, FILE *stream, int indent, int fwidth);
+
+/* Main local heap routines */
+H5_DLL H5HG_heap_t *H5HG__create_local(H5F_t *f, size_t init_size);
+H5_DLL herr_t H5HG__insert_local(H5F_t *f, H5HG_heap_t *heap, size_t size, const void *obj, size_t *idx_out);
+H5_DLL herr_t H5HG__read_local(H5F_t *f, const H5HG_heap_t *heap, size_t idx, void *object, size_t *buf_size);
+H5_DLL herr_t H5HG__remove_local(H5F_t *f, H5HG_heap_t *heap, size_t idx, hbool_t *heap_empty);
+H5_DLL htri_t H5HG__is_empty_local(const H5HG_heap_t *heap);
+H5_DLL herr_t H5HG__get_obj_size_local(H5F_t *f, const H5HG_heap_t *heap, size_t idx, size_t *obj_size);
+H5_DLL herr_t H5HG__free_local(H5HG_heap_t *heap);
+
+/* Chunk-local heap image encoding/decoding */
+H5_DLL herr_t       H5HG__encode_local(H5F_t *f, const H5HG_heap_t *heap, uint8_t **image_out,
+                                       size_t *image_len_out);
+H5_DLL H5HG_heap_t *H5HG__decode_local(H5F_t *f, const void *image, size_t len);
+
+/* Chunk-local heap-set routines */
+H5_DLL H5HG_local_heapset_t *H5HG__create_local_heapset(void);
+H5_DLL herr_t H5HG__insert_local_heapset(H5F_t *f, H5HG_local_heapset_t **heapset_ptr, size_t size,
+                                         const void *obj, uint16_t *heap_slot_out, uint16_t *obj_idx_out);
+H5_DLL herr_t H5HG__read_local_heapset(H5F_t *f, const H5HG_local_heapset_t *heapset, uint16_t heap_slot,
+                                       uint16_t obj_idx, void *object, size_t *buf_size);
+H5_DLL herr_t H5HG__remove_local_heapset(H5F_t *f, H5HG_local_heapset_t *heapset, uint16_t heap_slot,
+                                         uint16_t obj_idx);
+H5_DLL htri_t H5HG__is_empty_local_heapset(const H5HG_local_heapset_t *heapset);
+H5_DLL herr_t H5HG__free_local_heapset(H5HG_local_heapset_t *heapset);
+H5_DLL herr_t H5HG__copy_local_heapset(H5F_t *f, const H5HG_local_heapset_t *heapset,
+                                       H5HG_local_heapset_t **copy_out);
+H5_DLL herr_t H5HG__get_local_heapset_alloc_size(const H5HG_local_heapset_t *heapset, size_t *size_out);
+
+/* Complete logical H5_SECTION_VL heap-set image encoding/decoding */
+H5_DLL herr_t H5HG__encode_local_heapset(H5F_t *f, const H5HG_local_heapset_t *heapset, uint8_t **image_out,
+                                         size_t *image_len_out);
+H5_DLL H5HG_local_heapset_t *H5HG__decode_local_heapset(H5F_t *f, const void *image, size_t len);
 
 #endif /* H5HGprivate_H */

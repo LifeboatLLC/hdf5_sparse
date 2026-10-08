@@ -1168,6 +1168,19 @@ done:
  * Return:   Non-negative(true/false) on success
  *           Negative on failure
  *
+ * Updated:     Variable-length datatypes using the structured-chunk layout
+ *              are allowed to retain their configured filters when the
+ *              dataspace is H5S_SIMPLE. Structured chunks encode and filter
+ *              the selection, fixed descriptors, and serialized chunk-local
+ *              VL heap-set sections independently, so the normal restriction
+ *              against filtering VL datatype storage does not apply.
+ *
+ *              In this case the function returns false, indicating that the
+ *              filters must not be ignored. NULL and scalar dataspaces, and
+ *              VL datatypes using other layouts, continue to follow the
+ *              existing optional-filter rules.
+ *
+ *                                              -- AZO   9/20/26
  *-------------------------------------------------------------------------
  */
 htri_t
@@ -1202,6 +1215,13 @@ H5Z_ignore_filters(hid_t dcpl_id, const H5T_t *type, const H5S_t *space)
         if (H5P_peek(dc_plist, H5D_CRT_LAYOUT_NAME, &layout) < 0)
             HGOTO_ERROR(H5E_PLIST, H5E_CANTGET, FAIL, "can't retrieve layout");
 
+        /*
+         * Structured chunks filter their sections independently, including
+         * sections belonging to a VL datatype.
+         */
+        if (layout.type == H5D_STRUCT_CHUNK && space_class == H5S_SIMPLE)
+            HGOTO_DONE(false);
+
         /* Get pipeline information depending on layout type */
         if (layout.type == H5D_STRUCT_CHUNK) {
             H5O_stc_pline_t pline; /* Object's I/O pipeline information */
@@ -1214,8 +1234,14 @@ H5Z_ignore_filters(hid_t dcpl_id, const H5T_t *type, const H5S_t *space)
 
                 for (ii = 0, filt_sect = &pline.filt_sects[0]; ii < pline.tot_filt_nsects;
                      ii++, filt_sect++) {
-                    if (!(filter->flags & H5Z_FLAG_OPTIONAL))
-                        HGOTO_ERROR(H5E_PLINE, H5E_CANTFILTER, FAIL, "not suitable for filters");
+                    size_t filter_idx;
+
+                    for (filter_idx = 0; filter_idx < filt_sect->nused; filter_idx++) {
+                        const H5Z_filter_info_t *filter = &filt_sect->filter[filter_idx];
+
+                        if (!(filter->flags & H5Z_FLAG_OPTIONAL))
+                            HGOTO_ERROR(H5E_PLINE, H5E_CANTFILTER, FAIL, "not suitable for filters");
+                    }
                 }
             }
 

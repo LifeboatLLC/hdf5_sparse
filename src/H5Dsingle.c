@@ -665,6 +665,14 @@ H5D__single_idx_dump(const void *store, FILE *stream)
  *
  * Return:      Non-negative on success/Negative on failure
  *
+ * Updated:     Updated for VL support. For a three-section structured
+ *              chunk containing VL data, use the full eight-byte chunk-
+ *              size field. The serialized VL heap payload is not bounded
+ *              by the fixed logical chunk size, so that size cannot be
+ *              used to derive a safe narrower field.
+ *
+ *                                              -- AZO  09/16/26
+ *
  *-------------------------------------------------------------------------
  */
 static herr_t
@@ -686,11 +694,28 @@ H5D__single_stc_idx_init(const H5D_chk_idx_info_t *idx_info, const H5S_t H5_ATTR
      * allowing for an extra byte, in case the structured chunk
      * size (encoded selection + data) make the chunk larger.
      */
-    chunk_size_len =
-        1 + ((H5VM_log2_gen((uint64_t)idx_info->stc_layout->size) + idx_info->stc_storage->offset_size) /
-             idx_info->stc_storage->offset_size);
-    if (chunk_size_len > idx_info->stc_storage->offset_size)
-        chunk_size_len = idx_info->stc_storage->offset_size;
+
+    /* Update:
+     * A three-section VL chunk includes serialized heap payloads whose size is
+     * not bounded by the fixed logical chunk size. Use the full uint64_t width
+     * for its encoded single-chunk size.
+     */
+    /*
+     * STRUCT_CHUNK_SECTION_COUNT_ASSUMPTION: The current format uses two
+     * sections for fixed-size data and three for data containing VL values.
+     * Revisit this inference if new section kinds, multiple VL sections,
+     * or a dense VL layout are introduced.
+     */
+    if (idx_info->stc_storage->nsects == H5_SECTION_NUM)
+        chunk_size_len = 8;
+    else {
+        chunk_size_len =
+            1 + ((H5VM_log2_gen((uint64_t)idx_info->stc_layout->size) + idx_info->stc_storage->offset_size) /
+                 idx_info->stc_storage->offset_size);
+
+        if (chunk_size_len > idx_info->stc_storage->offset_size)
+            chunk_size_len = idx_info->stc_storage->offset_size;
+    }
 
     idx_info->stc_storage->u.single.chunk_size_len = chunk_size_len;
 

@@ -98,6 +98,50 @@ H5FL_BLK_EXTERN(gheap_chunk);
  */
 #define H5HG_NOBJS(f, z) ((((z)-H5HG_SIZEOF_HDR(f)) / H5HG_SIZEOF_OBJHDR(f) + 2))
 
+/*
+ * Normal allocation size for one chunk-local H5HG heap.
+ * This is an in-memory allocation policy, not a persistent file-format field.
+ */
+#define H5HG_LOCAL_NORMAL_HEAP_SIZE ((size_t)(512 * 1024))
+
+/*
+ * Number of heap slots addressable by the V1 descriptor.
+ *
+ * A 16-bit heap-slot field represents values 0 through UINT16_MAX
+ * inclusive, so there are UINT16_MAX + 1 possible stable slots.
+ */
+#define H5HG_LOCAL_MAX_HEAP_SLOTS ((size_t)UINT16_MAX + 1)
+
+/*
+ * Chunk-local heap-set image signature.
+ *
+ * "HGLS" is the current proposed four-byte V1 signature. It is a new
+ * heap-set format marker, not the existing H5HG collection signature.
+ */
+#define H5HG_LOCAL_HEAPSET_MAGIC   "HGLS"
+#define H5HG_LOCAL_HEAPSET_VERSION 1
+
+/*
+ * V1 reserves three bytes after the version field. This mirrors the
+ * existing H5HG header style and leaves room for future format flags or
+ * extensions without changing the fixed V1 prefix.
+ */
+#define H5HG_LOCAL_HEAPSET_NRESERVED 3
+
+/*
+ * Fixed V1 heap-set header:
+ *     magic + version + reserved bytes + 32-bit stable-slot count.
+ */
+#define H5HG_LOCAL_HEAPSET_SIZEOF_HDR                                                                        \
+    ((size_t)(H5_SIZEOF_MAGIC + 1 + H5HG_LOCAL_HEAPSET_NRESERVED + sizeof(uint32_t)))
+
+/*
+ * One stable-slot directory entry contains an image-relative member-heap
+ * offset followed by its encoded length. Both fields use the file's
+ * configured size-width encoding.
+ */
+#define H5HG_LOCAL_HEAPSET_SIZEOF_DIRENT(f) ((size_t)(2 * H5F_SIZEOF_SIZE(f)))
+
 /****************************/
 /* Package Private Typedefs */
 /****************************/
@@ -129,6 +173,17 @@ struct H5HG_heap_t {
                                   */
     struct H5F_shared_t *shared; /* Shared file */
     H5HG_obj_t          *obj;    /* Array of object descriptions */
+
+    size_t nlive; /* Number of live payloads */
+};
+
+struct H5HG_local_heapset_t {
+    size_t nslots;     /* High-water number of descriptor-visible heap slots */
+    size_t nalloc;     /* Number of allocated trailing heap-pointer slots */
+    size_t nlive;      /* Total live payload objects across all member heaps */
+    size_t alloc_size; /* Resident allocation owned by this heap set */
+
+    H5HG_heap_t *heaps[]; /* Stable heap slots; unused entries are NULL */
 };
 
 /******************************/

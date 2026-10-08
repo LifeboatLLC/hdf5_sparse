@@ -19,6 +19,8 @@
 /* Early typedefs to avoid circular dependencies */
 typedef struct H5T_t H5T_t;
 
+struct H5HG_local_heapset_t;
+
 /* Include package's public headers */
 #include "H5Tpublic.h"
 #include "H5Tdevelop.h"
@@ -73,6 +75,38 @@ typedef struct {
     void           *free_info;  /* Free information */
 } H5T_vlen_alloc_info_t;
 
+/*
+ * Context for converting file-side VL descriptors that refer to the
+ * chunk-local H5HG heap set owned by one structured chunk.
+ *
+ * The context is installed only while that chunk is being processed.
+ * The initial single-threaded implementation stores the active context
+ * through H5T. The storage can later become thread-local without changing
+ * the callback interface.
+ *
+ * HEAPSET is a pointer to the structured chunk's heap-set pointer. The
+ * extra level of indirection is required because the first write may create
+ * the heap set and later insertions may reallocate the heap-set manager.
+ *
+ * ref_nbytes is the number of bytes after the four-byte sequence length in
+ * each file-side VL descriptor. Version 1 uses the first four reference
+ * bytes as:
+ *
+ *     bytes 0-1: 16-bit stable heap-slot index
+ *     bytes 2-3: 16-bit H5HG object index
+ *
+ * Any remaining reference bytes are reserved and encoded as zero.
+ *
+ * H5T does not own the file, heap set, or context object.
+ *
+ *                                       --AZO   08/25/26
+ */
+typedef struct H5T_vlen_chunk_ctx_t {
+    H5F_t                        *f;          /* File whose encoding parameters apply */
+    struct H5HG_local_heapset_t **heapset;    /* Current structured chunk's heap set */
+    size_t                        ref_nbytes; /* Size of descriptor reference field */
+} H5T_vlen_chunk_ctx_t;
+
 /* Forward declarations for prototype arguments */
 struct H5G_loc_t;
 struct H5G_name_t;
@@ -105,23 +139,39 @@ H5_DLL htri_t             H5T_is_relocatable(const H5T_t *dt);
 H5_DLL herr_t             H5T_unregister(H5T_pers_t pers, const char *name, H5T_t *src, H5T_t *dst,
                                          H5VL_object_t *owned_vol_obj, H5T_conv_t func);
 H5_DLL herr_t             H5T_vlen_reclaim_elmt(void *elem, const H5T_t *dt);
-H5_DLL htri_t             H5T_set_loc(H5T_t *dt, H5VL_object_t *file, H5T_loc_t loc);
-H5_DLL htri_t             H5T_is_sensible(const H5T_t *dt);
-H5_DLL herr_t             H5T_set_version(H5F_t *f, H5T_t *dt);
-H5_DLL herr_t             H5T_patch_file(H5T_t *dt, H5F_t *f);
-H5_DLL herr_t             H5T_patch_vlen_file(H5T_t *dt, H5VL_object_t *file);
-H5_DLL herr_t             H5T_own_vol_obj(H5T_t *dt, H5VL_object_t *vol_obj);
-H5_DLL htri_t             H5T_is_variable_str(const H5T_t *dt);
-H5_DLL H5T_t             *H5T_construct_datatype(H5VL_object_t *dt_obj);
-H5_DLL H5VL_object_t     *H5T_get_named_type(const H5T_t *dt);
-H5_DLL H5T_t             *H5T_get_actual_type(H5T_t *dt);
-H5_DLL herr_t             H5T_save_refresh_state(hid_t tid, struct H5O_shared_t *cached_H5O_shared);
-H5_DLL herr_t             H5T_restore_refresh_state(hid_t tid, struct H5O_shared_t *cached_H5O_shared);
-H5_DLL bool               H5T_already_vol_managed(const H5T_t *dt);
-H5_DLL htri_t             H5T_is_vl_storage(const H5T_t *dt);
+/*
+ * Recursively deletes the file-side VL payloads referenced by one element.
+ *
+ * DT must be a disk-located datatype whose VL nodes use the appropriate
+ * file-side callback class. For structured chunks, the datatype must first
+ * be privately copied and patched with H5T_patch_vlen_chunk_local(), and the
+ * corresponding H5T_vlen_chunk_ctx_t must be active.
+ */
+H5_DLL herr_t         H5T_vlen_delete_file_elmt(void *elem, const H5T_t *dt);
+H5_DLL htri_t         H5T_set_loc(H5T_t *dt, H5VL_object_t *file, H5T_loc_t loc);
+H5_DLL htri_t         H5T_is_sensible(const H5T_t *dt);
+H5_DLL herr_t         H5T_set_version(H5F_t *f, H5T_t *dt);
+H5_DLL herr_t         H5T_patch_file(H5T_t *dt, H5F_t *f);
+H5_DLL herr_t         H5T_patch_vlen_file(H5T_t *dt, H5VL_object_t *file);
+H5_DLL herr_t         H5T_own_vol_obj(H5T_t *dt, H5VL_object_t *vol_obj);
+H5_DLL htri_t         H5T_is_variable_str(const H5T_t *dt);
+H5_DLL H5T_t         *H5T_construct_datatype(H5VL_object_t *dt_obj);
+H5_DLL H5VL_object_t *H5T_get_named_type(const H5T_t *dt);
+H5_DLL H5T_t         *H5T_get_actual_type(H5T_t *dt);
+H5_DLL herr_t         H5T_save_refresh_state(hid_t tid, struct H5O_shared_t *cached_H5O_shared);
+H5_DLL herr_t         H5T_restore_refresh_state(hid_t tid, struct H5O_shared_t *cached_H5O_shared);
+H5_DLL bool           H5T_already_vol_managed(const H5T_t *dt);
+H5_DLL htri_t         H5T_is_vl_storage(const H5T_t *dt);
 H5_DLL herr_t H5T_invoke_vol_optional(H5T_t *dt, H5VL_optional_args_t *args, hid_t dxpl_id, void **req,
                                       H5VL_object_t **vol_obj_ptr);
 H5_DLL bool   H5T_is_numeric_with_unusual_unused_bits(const H5T_t *dt);
+
+/*
+ * Install the chunk-local VL context used by H5T conversion callbacks.
+ * Returns the previously active context so that it can be restored after
+ * the conversion completes.
+ */
+H5_DLL const H5T_vlen_chunk_ctx_t *H5T_set_vlen_chunk_ctx(const H5T_vlen_chunk_ctx_t *ctx);
 
 /* Reference specific functions */
 H5_DLL H5R_type_t H5T_get_ref_type(const H5T_t *dt);
@@ -143,5 +193,16 @@ H5_DLL int         H5T_get_offset(const H5T_t *dt);
 
 /* Fixed-point functions */
 H5_DLL H5T_sign_t H5T_get_sign(H5T_t const *dt);
+
+/*
+ * Replace the standard file-side variable-length callback class with the
+ * chunk-local callback class throughout the supplied datatype.
+ *
+ * This recursively updates every variable-length datatype contained within
+ * the datatype hierarchy while preserving the existing file-side descriptor
+ * size. The local heap reference is stored immediately after the four-byte
+ * sequence length and occupies ref_nbytes bytes.
+ */
+H5_DLL herr_t H5T_patch_vlen_chunk_local(H5T_t *dt, size_t ref_nbytes);
 
 #endif /* H5Tprivate_H */

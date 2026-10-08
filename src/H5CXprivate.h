@@ -267,6 +267,7 @@ typedef struct H5CX_t {
     bool  vol_connector_prop_valid;           /* Whether property for VOL connector ID & info is valid */
     void *vol_wrap_ctx;                       /* VOL connector's "wrap context" for creating IDs */
     bool  vol_wrap_ctx_valid; /* Whether VOL connector's "wrap context" for creating IDs is valid */
+
 } H5CX_t;
 
 /* Typedef for nodes on the API context stack */

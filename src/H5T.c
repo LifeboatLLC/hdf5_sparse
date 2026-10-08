@@ -4986,6 +4986,18 @@ H5T_get_size(const H5T_t *dt)
  *
  *            Failure:    0, never fails
  *
+ * updated:
+ *         Include the VL representation backend in datatype identity.
+ *
+ *         Ordinary disk VL and chunk-local VL can have identical
+ *         sizes, locations, base types, and file pointers, but use
+ *         different descriptor access callbacks.
+ *
+ *         Conversion paths retain datatype copies, including compound
+ *         member types. Treating these backends as equal can therefore
+ *         reuse a path whose retained types use the wrong callbacks.
+ *
+ *                                              -- AZO 09/22/26
  *-------------------------------------------------------------------------
  */
 int
@@ -5273,6 +5285,26 @@ H5T_cmp(const H5T_t *dt1, const H5T_t *dt2, bool superset)
             else if (dt1->shared->u.vlen.loc == H5T_LOC_BADLOC && dt2->shared->u.vlen.loc != H5T_LOC_BADLOC) {
                 HGOTO_DONE(1);
             }
+
+            /*
+             * Include the VL representation backend in datatype identity.
+             *
+             * Ordinary disk VL and chunk-local VL can have identical
+             * sizes, locations, base types, and file pointers, but use
+             * different descriptor access callbacks.
+             *
+             * Conversion paths retain datatype copies, including compound
+             * member types. Treating these backends as equal can therefore
+             * reuse a path whose retained types use the wrong callbacks.
+             *
+             * Callback classes have stable identity for the lifetime of
+             * cached paths. Order their integer address representations
+             * to provide a consistent ordering for the path-table search.
+             */
+            if ((uintptr_t)dt1->shared->u.vlen.cls < (uintptr_t)dt2->shared->u.vlen.cls)
+                HGOTO_DONE(-1);
+            if ((uintptr_t)dt1->shared->u.vlen.cls > (uintptr_t)dt2->shared->u.vlen.cls)
+                HGOTO_DONE(1);
 
             /* Don't allow VL types in different files to compare as equal */
             if (dt1->shared->u.vlen.file < dt2->shared->u.vlen.file)

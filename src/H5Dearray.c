@@ -2116,6 +2116,17 @@ done:
  * Return:      Non-negative on success (with the LAYOUT argument initialized
  *              and ready to write to an object header). Negative on failure.
  *
+ * Updated:     For three-section structured chunks, which include a
+ *              variable-length data section, use an eight-byte encoded chunk
+ *              size in the extensible-array record. VL payloads can make the
+ *              encoded chunk substantially larger than the fixed-size chunk
+ *              described by LAYOUT, so the size cannot safely be derived from
+ *              LAYOUT->SIZE.
+ *
+ *              Two-section structured chunks retain the existing calculated
+ *              width to preserve their current record representation.
+ *
+ *                                                  -- AZO    09/20/26
  *-------------------------------------------------------------------------
  */
 static herr_t
@@ -2143,10 +2154,23 @@ H5D__earray_stc_idx_create(const H5D_chk_idx_info_t *idx_info)
      * allowing for an extra byte, in case the structured chunk
      * size (encoded selection + data) make the chunk larger.
      */
-    chunk_size_len =
-        1 + ((H5VM_log2_gen((uint64_t)layout->size) + storage->offset_size) / storage->offset_size);
-    if (chunk_size_len > storage->offset_size)
-        chunk_size_len = storage->offset_size;
+    /*
+     * STRUCT_CHUNK_SECTION_COUNT_ASSUMPTION: The current format uses two
+     * sections for fixed-size data and three for data containing VL values.
+     * Revisit this inference if new section kinds, multiple VL sections,
+     * or a dense VL layout are introduced.
+     */
+    if (storage->nsects == 3) {
+        chunk_size_len = 8;
+    }
+    else {
+        chunk_size_len =
+            1 + ((H5VM_log2_gen((uint64_t)layout->size) + storage->offset_size) / storage->offset_size);
+
+        if (chunk_size_len > storage->offset_size) {
+            chunk_size_len = storage->offset_size;
+        }
+    }
 
     /* General parameters */
     if (idx_info->stc_pline->tot_filt_nsects > 0) {
@@ -2222,6 +2246,18 @@ done:
  * Return:      Success:    non-negative
  *              Failure:    negative
  *
+ * Updated:     For three-section structured chunks, which include a
+ *              variable-length data section, use an eight-byte encoded chunk
+ *              size when constructing the extensible-array client context.
+ *              This must match the width used when the extensible-array record
+ *              was created so that its fields are decoded at the correct
+ *              offsets.
+ *
+ *              Two-section structured chunks retain the existing calculated
+ *              width so existing records continue to be opened using their
+ *              original representation.
+ *
+ *                                              -- AZO   09/20/26
  *-------------------------------------------------------------------------
  */
 static herr_t
@@ -2248,11 +2284,17 @@ H5D__earray_stc_idx_open(const H5D_chk_idx_info_t *idx_info)
      * allowing for an extra byte, in case the structured chunk
      * size (encoded selection + data) make the chunk larger.
      */
-    chunk_size_len =
-        1 + ((H5VM_log2_gen((uint64_t)idx_info->stc_layout->size) + idx_info->stc_storage->offset_size) /
-             idx_info->stc_storage->offset_size);
-    if (chunk_size_len > idx_info->stc_storage->offset_size)
-        chunk_size_len = idx_info->stc_storage->offset_size;
+    if (idx_info->stc_storage->nsects == 3) {
+        chunk_size_len = 8;
+    }
+    else {
+        chunk_size_len =
+            1 + ((H5VM_log2_gen((uint64_t)idx_info->stc_layout->size) + idx_info->stc_storage->offset_size) /
+                 idx_info->stc_storage->offset_size);
+        if (chunk_size_len > idx_info->stc_storage->offset_size) {
+            chunk_size_len = idx_info->stc_storage->offset_size;
+        }
+    }
 
     /* Set up the user data */
     udata.f              = idx_info->f;

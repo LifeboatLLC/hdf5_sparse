@@ -61,6 +61,8 @@
 #include "H5SLprivate.h" /* Skip Lists                               */
 #include "H5VMprivate.h" /* Vector and array functions        */
 
+#include "H5HGprivate.h" /* Heapset functions */
+
 /****************/
 /* Local Macros */
 /****************/
@@ -89,9 +91,10 @@
 
 /* Intermediate struct for the chunk cache memory format */
 typedef struct H5D_chunk_cache_mem_t {
-    void  *data_buf;  /* Buffer pointer to the data values */
-    void  *sel_buf;   /* Buffer pointer to the encoded selection */
-    H5S_t *sel_space; /* Dataspace for encoded selection */
+    void                 *data_buf;   /* Buffer pointer to the data values */
+    void                 *sel_buf;    /* Buffer pointer to the encoded selection */
+    H5S_t                *sel_space;  /* Dataspace for encoded selection */
+    H5HG_local_heapset_t *vl_heapset; /* Variable-length heapset */
     /* size tracking */
     size_t sel_nbytes;      /* nbytes for selection */
     size_t sel_alloc_size;  /* alloc_size for selection */
@@ -196,6 +199,23 @@ static herr_t H5D__struct_chunk_layout_query(H5D_t *dset, hsize_t *chunk_dims, b
 
 static herr_t H5D__struct_chunk_delete_chunk(H5D_t *dset, const hsize_t *scaled /*in*/, haddr_t addr,
                                              hsize_t disk_size);
+
+/*
+ *  Shared chunk cache layout callbacks for structured global heap/heapset
+ *
+ */
+static herr_t H5D__struct_chunk_get_alloc_size(const H5D_chunk_cache_mem_t *chk, size_t *alloc_size_out);
+
+static herr_t H5D__struct_chunk_get_vlen_ref_size(H5D_t *dset, size_t *ref_nbytes);
+
+static herr_t H5D__struct_chunk_prepare_vlen_type(H5D_t *dset, const H5T_t *file_type,
+                                                  const H5T_t *other_type, bool file_is_src,
+                                                  H5T_t **chunk_file_type, H5T_path_t **chunk_tpath,
+                                                  size_t *ref_nbytes);
+
+static herr_t H5D__struct_chunk_vlen_convert(const H5T_vlen_chunk_ctx_t *ctx, H5T_path_t *tpath,
+                                             const H5T_t *src_type, const H5T_t *dst_type, size_t nelmts,
+                                             void *buf, void *bkg);
 
 /*********************/
 /* Package Variables */
@@ -327,13 +347,27 @@ done:
  *
  * Return:    true or false
  *
+ *
+ * Updated:     Selection I/O is disabled for structured chunks whose datatype
+ *              contains variable-length data. Their file-side descriptors
+ *              reference payloads owned by the decoded chunk's local H5HG heap
+ *              set and must be processed through the SCC representation and
+ *              chunk-local H5T conversion callbacks.
+ *
+ *              Allowing selection I/O would bypass that decoding, ownership,
+ *              and conversion path. When VL data is detected, selection I/O
+ *              is therefore disabled and H5D_SEL_IO_CHUNK_CACHE is recorded
+ *              as the reason before returning successfully.
+ *
+ *                                              -- AZO   9/14/26
  *-------------------------------------------------------------------------
  */
 static herr_t
 H5D__struct_chunk_may_use_select_io(H5D_io_info_t *io_info, const H5D_dset_io_info_t *dset_info)
 {
-    const H5D_t *dataset   = NULL;    /* Local pointer to dataset info */
-    herr_t       ret_value = SUCCEED; /* Return value */
+    const H5D_t *dataset       = NULL; /* Local pointer to dataset info */
+    htri_t       has_vlen_type = false;
+    herr_t       ret_value     = SUCCEED; /* Return value */
 
     FUNC_ENTER_PACKAGE
 
@@ -343,6 +377,20 @@ H5D__struct_chunk_may_use_select_io(H5D_io_info_t *io_info, const H5D_dset_io_in
 
     dataset = dset_info->dset;
     assert(dataset);
+
+    /*
+     * VL structured chunks must pass through the decoded SCC representation
+     * so H5T can resolve file-side descriptors through the chunk-local H5HG
+     * heap set. Selection I/O would bypass that ownership and conversion path.
+     */
+    if ((has_vlen_type = H5T_detect_class(dataset->shared->type, H5T_VLEN, false)) < 0)
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "unable to determine whether datatype contains VL");
+
+    if (has_vlen_type) {
+        io_info->use_select_io = H5D_SELECTION_IO_MODE_OFF;
+        io_info->no_selection_io_cause |= H5D_SEL_IO_CHUNK_CACHE;
+        HGOTO_DONE(SUCCEED);
+    }
 
     /* Don't use selection I/O if there are filters on the dataset (for now) */
     if (dataset->shared->dcpl_cache.stc_pline.tot_filt_nsects > 0) {
@@ -664,6 +712,11 @@ done:
  *
  * Return:      SUCCEED/FAIL
  *
+ * Updated:
+ *              Added support for H5_SECTION_VL
+ *
+ *                                      --AZO   09/15/26
+ *
  *-------------------------------------------------------------------------
  */
 herr_t
@@ -723,8 +776,24 @@ H5D__struct_chunk_set_sizes(H5D_t *dset)
 
     /* Set up info for structured chunk composition */
     if (has_vlen_type) {
-        /* TBD: not handled yet for structured chunk */
-        assert("not implemented yet" && 0);
+        /*
+         * Sparse VL structured chunks contain three logical sections:
+         *
+         *      H5_SECTION_SELECTION
+         *      H5_SECTION_FIXED
+         *      H5_SECTION_VL
+         *
+         * The fixed section contains the file-side VL descriptors.
+         * The Vl section contains the versioned chunk-local H5HG
+         * heap-set image referenced by those descriptors.
+         *
+         */
+        dset->shared->layout.storage.u.struct_chunk.nsects    = H5_SECTION_NUM; /* 3 */
+        dset->shared->layout.storage.u.struct_chunk.nsects_md = H5_SECTION_NUM; /* 3 */
+
+        dset->shared->layout.storage.u.struct_chunk.seq_sects_md[0] = H5_SECTION_SELECTION; /* 0 */
+        dset->shared->layout.storage.u.struct_chunk.seq_sects_md[1] = H5_SECTION_FIXED;     /* 1 */
+        dset->shared->layout.storage.u.struct_chunk.seq_sects_md[2] = H5_SECTION_VL;        /* 2 */
     }
     else { /* Fixed-size data */
         dset->shared->layout.storage.u.struct_chunk.nsects          = 2;
@@ -1525,7 +1594,30 @@ done:
  * NOTE: On entry: [chunk] is the pointer to the on disk file format chunk buffer
  *       On exit: [chunk] is the pointer to the chunk intermediate struct
  *
- * NOTE: Only handle two sections for now
+ *
+ * Updated:     Added support for decoding three-section structured chunks
+ *              containing variable-length data. The selection, fixed-value
+ *              descriptor, and serialized VL heap-set sections are separated
+ *              using the stored section boundaries and are independently
+ *              unfiltered and checksum-verified as configured.
+ *
+ *              The VL section is decoded into a chunk-local H5HG heap set
+ *              owned by the intermediate chunk. Section boundaries are
+ *              validated before they are used so malformed offsets cannot
+ *              cause size underflow or out-of-bounds section access.
+ *
+ *              After decoding, NBYTES describes only the logical selection
+ *              and fixed-data bytes. ALLOC_SIZE also includes the resident
+ *              allocation owned by the decoded VL heap set, obtained through
+ *              the structured-chunk allocation helper. Partial-construction
+ *              cleanup releases the heap set and all other resources created
+ *              during decoding.
+ *
+ *              This update supersedes the earlier two-section limitation
+ *              noted above while preserving two-section decoding for
+ *              structured chunks without VL data.
+ *
+ *                                              -- AZO   9/20/26
  *
  *-------------------------------------------------------------------------
  */
@@ -1533,27 +1625,65 @@ static herr_t
 H5D__struct_chunk_decode(H5D_t *dset, size_t *nbytes /*in,out*/, size_t *alloc_size /*in,out*/,
                          bool partial_bound, void **chunk /*in,out*/, void *_udata)
 {
-    H5D_chunk_ud_t        *udata = (H5D_chunk_ud_t *)_udata;
-    H5D_chunk_cache_mem_t *chk;   /* Chunk's intermediate struct */
-    H5O_stc_pline_t       *pline; /* I/O pipeline info */
-    hbool_t                filtered = false;
-    uint32_t               stored_chksum;   /* Stored metadata checksum value */
-    uint32_t               computed_chksum; /* Computed metadata checksum value */
-    void                  *tmp;
-    const unsigned char   *sel_p;
-    herr_t                 ret_value = SUCCEED; /* Return value */
+    H5D_chunk_ud_t             *udata = (H5D_chunk_ud_t *)_udata;
+    H5D_chunk_cache_mem_t      *chk   = NULL; /* Chunk's intermediate struct */
+    H5O_stc_pline_t            *pline;        /* I/O pipeline info */
+    hbool_t                     filtered = false;
+    uint32_t                    stored_chksum;   /* Stored metadata checksum value */
+    uint32_t                    computed_chksum; /* Computed metadata checksum value */
+    void                       *tmp;
+    const unsigned char        *sel_p;
+    H5O_storage_struct_chunk_t *storage       = NULL; /* Structured-chunk storage information */
+    void                       *vl_buf        = NULL;
+    size_t                      vl_nbytes     = 0;
+    size_t                      vl_alloc_size = 0;
+    size_t                      fixed_end;
+    size_t                      resident_alloc_size;
+    hbool_t                     has_vlen_type                 = false;
+    bool                        section_is_md[H5_SECTION_NUM] = {false};
+    unsigned                    u;
+    herr_t                      ret_value = SUCCEED; /* Return value */
 
     FUNC_ENTER_PACKAGE
 
     /* Sanity checks */
     assert(dset);
 
+    storage = &dset->shared->layout.storage.u.struct_chunk;
+
     pline = &(dset->shared->dcpl_cache.stc_pline);
     if (pline && pline->tot_filt_nsects)
         filtered = true;
 
+    /*
+     * STRUCT_CHUNK_SECTION_COUNT_ASSUMPTION: The current format uses two
+     * sections for fixed-size data and three for data containing VL values.
+     * Revisit this inference if new section kinds, multiple VL sections,
+     * or a dense VL layout are introduced.
+     */
+    has_vlen_type = (storage->nsects == H5_SECTION_NUM);
+
+    /* Validate section boundaries before using them to split the chunk image */
+    if (*alloc_size < *nbytes || udata->offset[H5_SECTION_FIXED] > *nbytes)
+        HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL, "invalid structured chunk section bounds");
+
+    if (has_vlen_type) {
+        if (udata->offset[H5_SECTION_VL] < udata->offset[H5_SECTION_FIXED] ||
+            udata->offset[H5_SECTION_VL] > *nbytes)
+            HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL, "invalid structured chunk VL section bounds");
+
+        fixed_end = (size_t)udata->offset[H5_SECTION_VL];
+    }
+    else {
+        fixed_end = *nbytes;
+    }
+
+    for (u = 0; u < storage->nsects_md; u++) {
+        section_is_md[storage->seq_sects_md[u]] = true;
+    }
+
     /* Allocate the chunk intermediate struct */
-    if (NULL == (chk = H5MM_malloc(sizeof(H5D_chunk_cache_mem_t))))
+    if (NULL == (chk = H5MM_calloc(sizeof(H5D_chunk_cache_mem_t))))
         HGOTO_ERROR(H5E_RESOURCE, H5E_CANTALLOC, FAIL,
                     "memory allocation failed for intermediate chunk struct");
 
@@ -1561,8 +1691,12 @@ H5D__struct_chunk_decode(H5D_t *dset, size_t *nbytes /*in,out*/, size_t *alloc_s
     chk->sel_nbytes = chk->sel_alloc_size = udata->offset[1];
 
     /* nbytes and alloc_size for data values */
-    chk->data_nbytes     = *nbytes - chk->sel_nbytes;
-    chk->data_alloc_size = *alloc_size - chk->sel_alloc_size;
+    chk->data_nbytes     = fixed_end - chk->sel_nbytes;
+    chk->data_alloc_size = chk->data_nbytes + (*alloc_size - *nbytes);
+
+    if (has_vlen_type) {
+        vl_nbytes = vl_alloc_size = *nbytes - fixed_end;
+    }
 
     /* Allocate a buffer for the encoded selection */
     if (NULL == (chk->sel_buf = H5MM_malloc(chk->sel_alloc_size)))
@@ -1572,11 +1706,20 @@ H5D__struct_chunk_decode(H5D_t *dset, size_t *nbytes /*in,out*/, size_t *alloc_s
     H5MM_memcpy(chk->sel_buf, *chunk, chk->sel_nbytes);
 
     /* Allocate a buffer for the data values */
-    if (NULL == (chk->data_buf = H5MM_malloc(chk->data_alloc_size)))
-        HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, FAIL, "memory allocation failed for data buffer");
+    if (chk->data_alloc_size > 0) {
+        if (NULL == (chk->data_buf = H5MM_malloc(chk->data_alloc_size)))
+            HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, FAIL, "memory allocation failed for data buffer");
 
-    /* Copy over the data values */
-    H5MM_memcpy(chk->data_buf, (uint8_t *)(*chunk) + chk->sel_nbytes, chk->data_nbytes);
+        H5MM_memcpy(chk->data_buf, (uint8_t *)(*chunk) + chk->sel_nbytes, chk->data_nbytes);
+    }
+
+    /* Allocate a temporary buffer for the encoded VL heap set */
+    if (vl_alloc_size > 0) {
+        if (NULL == (vl_buf = H5MM_malloc(vl_alloc_size)))
+            HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, FAIL, "memory allocation failed for encoded VL buffer");
+
+        H5MM_memcpy(vl_buf, (uint8_t *)(*chunk) + fixed_end, vl_nbytes);
+    }
 
     /* Decompress the encoded selection  & data values */
     if (filtered && !partial_bound) {
@@ -1610,24 +1753,53 @@ H5D__struct_chunk_decode(H5D_t *dset, size_t *nbytes /*in,out*/, size_t *alloc_s
                         break;
 
                     case H5_SECTION_VL:
+                        if (vl_nbytes > 0)
+                            if (H5Z_apply_filters(filt_sect->nused, filt_sect->filter, H5Z_FLAG_REVERSE,
+                                                  &udata->filt_mask[2], err_detect, filter_cb, &vl_nbytes,
+                                                  &vl_alloc_size, &vl_buf) < 0)
+                                HGOTO_ERROR(H5E_DATASET, H5E_CANTFILTER, FAIL, "output pipeline failed");
+                        break;
+
                     case H5_SECTION_NUM:
                     default:
                         assert(0 && "Unknown action?!?");
                 }
             } /* end if nused */
-
-        } /* end for */
+        }     /* end for */
     }
-    /* Get stored and computed checksums */
-    if (H5F_get_checksums(chk->sel_buf, chk->sel_nbytes, &stored_chksum, &computed_chksum) < 0)
-        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't get checksums");
-    if (stored_chksum != computed_chksum)
-        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "checksums verification failed");
+    /* Verify section checksums */
+    if (section_is_md[H5_SECTION_SELECTION]) {
+        if (chk->sel_nbytes < H5_SIZEOF_CHKSUM)
+            HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL, "encoded selection is too small for checksum");
+        if (H5F_get_checksums(chk->sel_buf, chk->sel_nbytes, &stored_chksum, &computed_chksum) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't get checksums");
+        if (stored_chksum != computed_chksum)
+            HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "checksums verification failed");
 
-    chk->sel_nbytes -= H5_SIZEOF_CHKSUM;
-    chk->sel_alloc_size -= H5_SIZEOF_CHKSUM;
+        chk->sel_nbytes -= H5_SIZEOF_CHKSUM;
+    }
 
-    sel_p = chk->sel_buf;
+    if (section_is_md[H5_SECTION_FIXED] && chk->data_nbytes > 0) {
+        if (chk->data_nbytes < H5_SIZEOF_CHKSUM)
+            HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL, "encoded data is too small for checksum");
+        if (H5F_get_checksums(chk->data_buf, chk->data_nbytes, &stored_chksum, &computed_chksum) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't get checksums");
+        if (stored_chksum != computed_chksum)
+            HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "checksums verification failed");
+
+        chk->data_nbytes -= H5_SIZEOF_CHKSUM;
+    }
+
+    if (section_is_md[H5_SECTION_VL] && vl_nbytes > 0) {
+        if (vl_nbytes <= H5_SIZEOF_CHKSUM)
+            HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL, "encoded VL data is too small for checksum");
+        if (H5F_get_checksums(vl_buf, vl_nbytes, &stored_chksum, &computed_chksum) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't get checksums");
+        if (stored_chksum != computed_chksum)
+            HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "checksums verification failed");
+
+        vl_nbytes -= H5_SIZEOF_CHKSUM;
+    }
 
     sel_p = chk->sel_buf;
 
@@ -1635,15 +1807,54 @@ H5D__struct_chunk_decode(H5D_t *dset, size_t *nbytes /*in,out*/, size_t *alloc_s
     if (NULL == (chk->sel_space = H5S_decode(&sel_p)))
         HGOTO_ERROR(H5E_DATASET, H5E_CANTDECODE, FAIL, "unable to decode dataspace");
 
+    /* Decode the chunk-local VL heap set */
+    if (vl_nbytes > 0) {
+        if (NULL == (chk->vl_heapset = H5HG__decode_local_heapset(dset->oloc.file, vl_buf, vl_nbytes)))
+            HGOTO_ERROR(H5E_DATASET, H5E_CANTDECODE, FAIL, "unable to decode chunk-local VL heap set");
+    }
+
+    /*
+     * Release checksum space and unused filter-buffer capacity before
+     * charging the decoded chunk to SCC. The VL heap set is retained
+     * and its full resident allocation is counted separately below.
+     */
+    {
+        void  *decoded_chunk  = chk;
+        size_t decoded_nbytes = 0;
+
+        if (H5D__struct_chunk_condense(dset, &decoded_nbytes, &decoded_chunk, udata) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "unable to condense decoded structured chunk");
+
+        assert(decoded_chunk == chk);
+    }
+
+    if (H5D__struct_chunk_get_alloc_size(chk, &resident_alloc_size) < 0)
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "unable to determine structured chunk allocation size");
+
     /* Return values on exit */
-    *nbytes     = (chk->sel_nbytes + chk->data_nbytes);
-    *alloc_size = *nbytes;
+    *nbytes     = chk->sel_nbytes + chk->data_nbytes;
+    *alloc_size = resident_alloc_size;
 
     tmp    = *chunk;
     *chunk = chk;
+    chk    = NULL;
     tmp    = H5MM_xfree(tmp);
 
 done:
+    vl_buf = H5MM_xfree(vl_buf);
+
+    if (chk) {
+        if (chk->vl_heapset && H5HG__free_local_heapset(chk->vl_heapset) < 0)
+            HDONE_ERROR(H5E_HEAP, H5E_CANTFREE, FAIL, "unable to free chunk-local VL heap set");
+
+        if (chk->sel_space && H5S_close(chk->sel_space) < 0)
+            HDONE_ERROR(H5E_DATASPACE, H5E_CANTRELEASE, FAIL, "unable to release decoded selection");
+
+        chk->sel_buf  = H5MM_xfree(chk->sel_buf);
+        chk->data_buf = H5MM_xfree(chk->data_buf);
+        chk           = H5MM_xfree(chk);
+    }
+
     FUNC_LEAVE_NOAPI(ret_value)
 
 } /* H5D__struct_chunk_decode() */
@@ -1694,6 +1905,33 @@ done:
  *       to the original caller-owned raw buffer. The callback releases only
  *       allocations that it created internally.
  *
+ *       This callback implements selection-only decoding for a
+ *       caller that requests defined-value metadata without the
+ *       fixed records or VL payloads. Its presence in the layout
+ *       callback table does not establish that the current SCC
+ *       read path invokes it; verify SCC wiring and test coverage
+ *       before treating this as an exercised path.
+ *
+ * Updated:     Metadata-only decoding remains limited to the defined-value
+ *              selection even when the encoded structured chunk also contains
+ *              fixed descriptors and a chunk-local VL section. Filters for
+ *              the fixed and VL sections are intentionally ignored because
+ *              those value sections remain on disk until full decoding is
+ *              requested.
+ *
+ *              The intermediate structure is zero initialized so DATA_BUF and
+ *              VL_HEAPSET remain NULL and the result can safely be passed to
+ *              the normal structured-chunk eviction callback. Failure cleanup
+ *              also follows the complete chunk ownership rule and releases
+ *              any internally created selection, buffers, or heap set.
+ *
+ *              Ownership of the caller's encoded buffer is transferred only
+ *              after selection decoding succeeds. This preserves the original
+ *              raw buffer on failure and prevents ambiguous ownership or
+ *              double release by the SCC.
+ *
+ *                                              -- AZO   9/20/26
+ *
  *-------------------------------------------------------------------------
  */
 static herr_t
@@ -1701,8 +1939,8 @@ H5D__struct_chunk_decode_defined_values(H5D_t *dset, size_t *nbytes /*in,out*/, 
                                         bool partial_bound, void **chunk /*in,out*/, void *_udata)
 {
     H5D_chunk_ud_t        *udata = (H5D_chunk_ud_t *)_udata;
-    H5D_chunk_cache_mem_t *chk;   /* Chunk's intermediate struct */
-    H5O_stc_pline_t       *pline; /* I/O pipeline info */
+    H5D_chunk_cache_mem_t *chk   = NULL; /* Chunk's intermediate struct */
+    H5O_stc_pline_t       *pline;        /* I/O pipeline info */
     hbool_t                filtered = false;
     uint32_t               stored_chksum;   /* Stored metadata checksum value */
     uint32_t               computed_chksum; /* Computed metadata checksum value */
@@ -1779,6 +2017,10 @@ H5D__struct_chunk_decode_defined_values(H5D_t *dset, size_t *nbytes /*in,out*/, 
                         break;
 
                     case H5_SECTION_VL:
+                        /* metadata-only decode materializes only the selection section.
+                         * Fixed and VL sections remain on disk and are intentionally ignored.
+                         */
+                        break;
                     case H5_SECTION_NUM:
                     default:
                         assert(0 && "Unknown action?!?");
@@ -1789,21 +2031,23 @@ H5D__struct_chunk_decode_defined_values(H5D_t *dset, size_t *nbytes /*in,out*/, 
     }
 
     /*
-     * chk->sel_buf is authoritative here. Reverse filtering may have replaced
-     * or resized this buffer, so checksum validation must use the decoded
-     * selection buffer rather than the original raw disk buffer.
+     * The encoded selection must contain its metadata checksum before
+     * H5F_get_checksums() examines the trailing checksum bytes.
      */
-    if (H5F_get_checksums(chk->sel_buf, chk->sel_nbytes, &stored_chksum, &computed_chksum) < 0)
-        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't get checksums");
-
-    if (stored_chksum != computed_chksum)
-        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "checksums verification failed");
-
-    if (chk->sel_nbytes < H5_SIZEOF_CHKSUM || chk->sel_alloc_size < H5_SIZEOF_CHKSUM)
+    if (chk->sel_nbytes < H5_SIZEOF_CHKSUM)
         HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL, "encoded selection is smaller than checksum size");
 
+    if (H5F_get_checksums(chk->sel_buf, chk->sel_nbytes, &stored_chksum, &computed_chksum) < 0)
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't get selection checksums");
+
+    if (stored_chksum != computed_chksum)
+        HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL, "selection checksum verification failed");
+
+    /*
+     * Removing the checksum changes the bytes logically in use, but the
+     * allocated buffer itself has not shrunk.
+     */
     chk->sel_nbytes -= H5_SIZEOF_CHKSUM;
-    chk->sel_alloc_size -= H5_SIZEOF_CHKSUM;
 
     sel_p = chk->sel_buf;
 
@@ -1833,6 +2077,11 @@ done:
      * callback.
      */
     if (chk) {
+        if (chk->vl_heapset) {
+            if (H5HG__free_local_heapset(chk->vl_heapset) < 0)
+                HDONE_ERROR(H5E_HEAP, H5E_CANTFREE, FAIL, "unable to free decoded chunk-local VL heap set");
+            chk->vl_heapset = NULL;
+        }
         if (chk->sel_space) {
             if (H5S_close(chk->sel_space) < 0)
                 HDONE_ERROR(H5E_DATASPACE, H5E_CANTRELEASE, FAIL,
@@ -1864,6 +2113,19 @@ done:
  * Return:    Non-negative on success/Negative on failure
  *
  * NOTE: On exit: [chunk] is the pointer to the chunk intermedidate struct
+ *
+ * Updated:     New structured chunks now initialize their chunk-local VL
+ *              heap-set pointer to NULL. The heap set is created lazily when
+ *              the first VL payload is stored, so an empty chunk owns no VL
+ *              allocation.
+ *
+ *              Explicit initialization is required because the intermediate
+ *              structure is allocated with H5MM_malloc() and is later handled
+ *              by the common eviction and accounting paths, which use a NULL
+ *              heap-set pointer to distinguish chunks without resident VL
+ *              payload storage.
+ *
+ *                                              -- AZO   9/18/26
  *-------------------------------------------------------------------------
  */
 static herr_t
@@ -1887,9 +2149,10 @@ H5D__struct_chunk_new_chunk(H5D_t *dset, bool fill, size_t *nbytes /*out*/, size
         HGOTO_ERROR(H5E_RESOURCE, H5E_CANTALLOC, FAIL,
                     "memory allocation failed for intermediate chunk struct");
 
-    chk->sel_space = NULL;
-    chk->sel_buf   = NULL;
-    chk->data_buf  = NULL;
+    chk->sel_space  = NULL;
+    chk->sel_buf    = NULL;
+    chk->data_buf   = NULL;
+    chk->vl_heapset = NULL;
 
     chk->sel_nbytes      = 0;
     chk->sel_alloc_size  = 0;
@@ -1924,6 +2187,20 @@ done:
  *
  * Return:    Non-negative on success/Negative on failure
  *
+ * Updated:     Condensation now validates the used and allocated sizes of the
+ *              selection and fixed-data buffers before modifying them. Each
+ *              buffer is reduced to its logical used size, with zero-sized
+ *              buffers released explicitly and successful reallocations
+ *              published without losing the original pointer on failure.
+ *
+ *              The decoded chunk-local VL heap set is not condensed by this
+ *              routine. Its allocations are independently owned and tracked
+ *              by H5HG. Consequently, NBYTES continues to describe only the
+ *              logical selection and fixed-data bytes, while the resident VL
+ *              heap allocation remains part of the chunk's separately
+ *              calculated SCC allocation size.
+ *
+ *                                              -- AZO   9/19/26
  *-------------------------------------------------------------------------
  */
 static herr_t
@@ -1932,28 +2209,82 @@ H5D__struct_chunk_condense(H5D_t *dset, size_t *nbytes /*in, out*/, void **chunk
 {
     H5D_chunk_cache_mem_t *chk       = (H5D_chunk_cache_mem_t *)*chunk; /* Chunk's memory cache info */
     herr_t                 ret_value = SUCCEED;                         /* Return value */
+    void                  *new_buf   = NULL;
 
     FUNC_ENTER_PACKAGE
 
     /* Sanity checks */
     assert(dset);
+    assert(nbytes);
+    assert(chunk);
+    assert(*chunk);
+
+    /*
+     * The chunk-local H5HG heap set is deliberately not condensed here.
+     * Only the selection and fixed-data buffers are managed by this callback.
+     */
+    if (chk->sel_nbytes > SIZE_MAX - chk->data_nbytes)
+        HGOTO_ERROR(H5E_DATASET, H5E_OVERFLOW, FAIL, "structured chunk used-size overflow");
 
     if ((chk->sel_alloc_size + chk->data_alloc_size) == (chk->sel_nbytes + chk->data_nbytes))
         /* Nothing to condense */
         HGOTO_DONE(SUCCEED);
-    if (NULL == (chk->sel_buf = H5MM_realloc(chk->sel_buf, chk->sel_nbytes)))
-        HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, FAIL, "memory reallocation failed for raw data chunk");
-    if (NULL == (chk->data_buf = H5MM_realloc(chk->data_buf, chk->data_nbytes)))
-        HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, FAIL, "memory reallocation failed for raw data chunk");
 
-    chk->sel_alloc_size  = chk->sel_nbytes;
-    chk->data_alloc_size = chk->data_nbytes;
-    *nbytes              = chk->sel_nbytes + chk->data_nbytes;
-    *chunk               = chk;
+    /*
+     * Condense the resident selection buffer. A zero-byte buffer is released
+     * explicitly because realloc(ptr, 0) is allowed to return NULL without
+     * representing an allocation failure.
+     */
+    if (chk->sel_alloc_size != chk->sel_nbytes) {
+        if (0 == chk->sel_nbytes) {
+            chk->sel_buf = H5MM_xfree(chk->sel_buf);
+        }
+        else {
+            if (NULL == (new_buf = H5MM_realloc(chk->sel_buf, chk->sel_nbytes)))
+                HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, FAIL,
+                            "unable to condense structured chunk selection buffer");
+
+            chk->sel_buf = new_buf;
+            new_buf      = NULL;
+        }
+
+        chk->sel_alloc_size = chk->sel_nbytes;
+    }
+
+    /*
+     * Condense the fixed-data/descriptor buffer. Publish the realloc result
+     * only after realloc succeeds so the old pointer is not lost on failure.
+     */
+    if (chk->data_alloc_size != chk->data_nbytes) {
+        if (0 == chk->data_nbytes) {
+            chk->data_buf = H5MM_xfree(chk->data_buf);
+        }
+        else {
+            if (NULL == (new_buf = H5MM_realloc(chk->data_buf, chk->data_nbytes)))
+                HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, FAIL,
+                            "unable to condense structured chunk data buffer");
+
+            chk->data_buf = new_buf;
+            new_buf       = NULL;
+        }
+
+        chk->data_alloc_size = chk->data_nbytes;
+    }
+
+    /*
+     * NBYTES describes logical bytes used by the selection and fixed-data
+     * buffers. Decoded VL heap memory remains separate resident allocation
+     * and is deliberately not added here.
+     */
+    if (chk->sel_nbytes > SIZE_MAX - chk->data_nbytes)
+        HGOTO_ERROR(H5E_DATASET, H5E_OVERFLOW, FAIL, "structured chunk used-size overflow");
+
+    *nbytes = chk->sel_nbytes + chk->data_nbytes;
+    *chunk  = chk;
 
 done:
     FUNC_LEAVE_NOAPI(ret_value)
-} /* H5D__struct_chunk_new_chunk() */
+} /* H5D__struct_chunk_condense() */
 
 /*-------------------------------------------------------------------------
  * Function:    H5D__struct_chunk_encode
@@ -1978,7 +2309,20 @@ done:
  * NOTE: --chunk_encode callback: fill in udata: offset, unfilt_size, filt_mask,
  * NOTE: --chunk_insert callback: fill in udata: addr, nbytes, chunk_idx
  *
- * NOTE: Only handle two sections for now
+ *
+ * Updated:     Added support for three-section VL structured chunks.
+ *              For VL datatypes, the fixed section contains chunk-local
+ *              descriptors and the VL section contains the serialized local
+ *              heap set. Metadata checksums and configured filters are applied
+ *              independently to the fixed and VL sections. The VL boundary is
+ *              recorded in udata->offset[H5_SECTION_VL].
+ *
+ *              This function retains its non-destructive behavior by encoding
+ *              the selection, fixed descriptors, and local heap set into
+ *              temporary buffers before assembling the final chunk image. The
+ *              decoded chunk and its local heap set remain owned by the caller.
+ *
+ *                                              -- AZO   9/16/26
  *-------------------------------------------------------------------------
  */
 static herr_t
@@ -1998,12 +2342,33 @@ H5D__struct_chunk_encode(H5D_t *dset, hsize_t *write_size /*out*/, hsize_t *writ
     hsize_t                      nelmts;
     size_t                       type_size;
     uint32_t                     metadata_chksum;
-    herr_t                       ret_value = SUCCEED; /* Return value */
+    void                        *vl_buf        = NULL; /* Temporary encoded VL section */
+    uint8_t                     *vl_image      = NULL; /* Image returned by H5HG encoder */
+    size_t                       vl_nbytes     = 0;
+    size_t                       vl_alloc_size = 0;
+    size_t                       write_nbytes  = 0;
+    hbool_t                      has_vlen      = false;
+    herr_t                       ret_value     = SUCCEED; /* Return value */
 
     FUNC_ENTER_PACKAGE
 
     /* Sanity checks */
     assert(dset);
+
+    /*
+     * STRUCT_CHUNK_SECTION_COUNT_ASSUMPTION: The current format uses two
+     * sections for fixed-size data and three for data containing VL values.
+     * Revisit this inference if new section kinds, multiple VL sections,
+     * or a dense VL layout are introduced.
+     */
+    if (dset->shared->layout.storage.u.struct_chunk.nsects == 2) {
+        has_vlen = false;
+    }
+    else if (dset->shared->layout.storage.u.struct_chunk.nsects == H5_SECTION_NUM) {
+        has_vlen = true;
+    }
+    else
+        HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL, "invalid structured chunk section count");
 
     pline = &(dset->shared->dcpl_cache.stc_pline);
     if (pline && pline->tot_filt_nsects)
@@ -2040,13 +2405,79 @@ H5D__struct_chunk_encode(H5D_t *dset, hsize_t *write_size /*out*/, hsize_t *writ
     assert(nelmts * type_size == chk->data_nbytes);
     assert(chk->data_alloc_size >= chk->data_nbytes);
 
-    data_nbytes     = chk->data_nbytes;
-    data_alloc_size = chk->data_alloc_size;
+    data_nbytes = chk->data_nbytes;
 
-    if (NULL == (data_buf = H5MM_malloc(data_alloc_size)))
-        HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, FAIL, "memory allocation failed for the chunk");
+    /*
+     * For a VL chunk, the fixed section contains descriptors and therefore
+     * is metadata. Add a checksum to those descriptor bytes.
+     *
+     * Fixed-size chunks retain the existing behavior and do not add a
+     * checksum to H5_SECTION_FIXED.
+     */
+    if (has_vlen) {
+        if (data_nbytes > SIZE_MAX - H5_SIZEOF_CHKSUM)
+            HGOTO_ERROR(H5E_DATASET, H5E_OVERFLOW, FAIL, "encoded fixed section size overflow");
 
-    H5MM_memcpy(data_buf, chk->data_buf, chk->data_nbytes);
+        data_alloc_size = data_nbytes + H5_SIZEOF_CHKSUM;
+    }
+    else
+        data_alloc_size = chk->data_alloc_size;
+
+    if (data_alloc_size > 0) {
+        if (NULL == (data_buf = H5MM_malloc(data_alloc_size)))
+            HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, FAIL, "memory allocation failed for the chunk");
+
+        if (data_nbytes > 0)
+            H5MM_memcpy(data_buf, chk->data_buf, data_nbytes);
+    }
+
+    if (has_vlen) {
+        metadata_chksum = H5_checksum_metadata(data_buf, data_nbytes, 0);
+
+        p = (uint8_t *)data_buf + data_nbytes;
+        UINT32ENCODE(p, metadata_chksum);
+
+        data_nbytes += H5_SIZEOF_CHKSUM;
+    }
+
+    /*
+     * Encode the chunk-local heap set as the third section. A NULL or
+     * logically empty heap set produces a zero-length VL section.
+     */
+    if (has_vlen) {
+        if (H5HG__encode_local_heapset(dset->oloc.file, chk->vl_heapset, &vl_image, &vl_nbytes) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_CANTENCODE, FAIL, "unable to encode chunk-local VL heap set");
+
+        vl_buf   = vl_image;
+        vl_image = NULL;
+
+        /*
+         * A nonempty VL section is metadata and therefore receives its own
+         * checksum. A zero-length section remains exactly zero bytes.
+         */
+        if (vl_nbytes > 0) {
+            void  *new_vl_buf;
+            size_t new_vl_size;
+
+            if (vl_nbytes > SIZE_MAX - H5_SIZEOF_CHKSUM)
+                HGOTO_ERROR(H5E_DATASET, H5E_OVERFLOW, FAIL, "encoded VL section size overflow");
+
+            new_vl_size = vl_nbytes + H5_SIZEOF_CHKSUM;
+
+            if (NULL == (new_vl_buf = H5MM_realloc(vl_buf, new_vl_size)))
+                HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, FAIL, "unable to extend encoded VL section");
+
+            vl_buf        = new_vl_buf;
+            vl_alloc_size = new_vl_size;
+
+            metadata_chksum = H5_checksum_metadata(vl_buf, vl_nbytes, 0);
+
+            p = (uint8_t *)vl_buf + vl_nbytes;
+            UINT32ENCODE(p, metadata_chksum);
+
+            vl_nbytes += H5_SIZEOF_CHKSUM;
+        }
+    }
 
     /* Compression */
     if (filtered) {
@@ -2057,6 +2488,9 @@ H5D__struct_chunk_encode(H5D_t *dset, hsize_t *write_size /*out*/, hsize_t *writ
 
         udata->unfilt_size[0] = sel_nbytes;
         udata->unfilt_size[1] = data_nbytes;
+
+        if (has_vlen)
+            udata->unfilt_size[2] = vl_nbytes;
 
         if (!partial_bound) {
 
@@ -2085,6 +2519,23 @@ H5D__struct_chunk_encode(H5D_t *dset, hsize_t *write_size /*out*/, hsize_t *writ
                             break;
 
                         case H5_SECTION_VL:
+                            if (!has_vlen)
+                                HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL,
+                                            "VL filter configured for non-VL structured chunk");
+
+                            /*
+                             * A zero-length VL section has no encoded bytes and
+                             * therefore has nothing to filter.
+                             */
+                            if (vl_nbytes > 0) {
+                                if (H5Z_apply_filters(filt_sect->nused, filt_sect->filter, 0,
+                                                      &udata->filt_mask[H5_SECTION_VL], err_detect, filter_cb,
+                                                      &vl_nbytes, &vl_alloc_size, &vl_buf) < 0)
+                                    HGOTO_ERROR(H5E_DATASET, H5E_CANTFILTER, FAIL,
+                                                "VL-section filter pipeline failed");
+                            }
+                            break;
+
                         case H5_SECTION_NUM:
                         default:
                             assert(0 && "Unknown action?!?");
@@ -2094,6 +2545,25 @@ H5D__struct_chunk_encode(H5D_t *dset, hsize_t *write_size /*out*/, hsize_t *writ
             } /* end for */
         }
     }
+
+    if (sel_nbytes > SIZE_MAX - data_nbytes)
+        HGOTO_ERROR(H5E_DATASET, H5E_OVERFLOW, FAIL, "structured chunk encoded size overflow");
+
+    write_nbytes = sel_nbytes + data_nbytes;
+
+    if (has_vlen) {
+        if (vl_nbytes > SIZE_MAX - write_nbytes)
+            HGOTO_ERROR(H5E_DATASET, H5E_OVERFLOW, FAIL, "structured chunk encoded size overflow");
+
+        write_nbytes += vl_nbytes;
+    }
+
+    /*
+     * Performance note: the encoded sections are assembled into one buffer
+     * here, which copies the selection, fixed records, and VL section.
+     * A future section-level vector write could submit their buffers and
+     * offsets separately, if the SCC write interface supports that form.
+     */
 
     /*
      * Build the final structured chunk image in a freshly allocated buffer.
@@ -2105,14 +2575,18 @@ H5D__struct_chunk_encode(H5D_t *dset, hsize_t *write_size /*out*/, hsize_t *writ
      * processing and prevents accidental overwrite of the allocation metadata.
      */
     {
-        void  *new_tot_buf  = NULL;
-        size_t write_nbytes = sel_nbytes + data_nbytes;
+        void *new_tot_buf = NULL;
 
         if (NULL == (new_tot_buf = H5MM_malloc(write_nbytes)))
             HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, FAIL, "memory allocation failed for the chunk");
 
         H5MM_memcpy(new_tot_buf, tot_buf, sel_nbytes);
-        H5MM_memcpy((uint8_t *)new_tot_buf + sel_nbytes, data_buf, data_nbytes);
+
+        if (data_nbytes > 0)
+            H5MM_memcpy((uint8_t *)new_tot_buf + sel_nbytes, data_buf, data_nbytes);
+
+        if (has_vlen && vl_nbytes > 0)
+            H5MM_memcpy((uint8_t *)new_tot_buf + sel_nbytes + data_nbytes, vl_buf, vl_nbytes);
 
         tot_buf     = H5MM_xfree(tot_buf);
         tot_buf     = new_tot_buf;
@@ -2122,13 +2596,23 @@ H5D__struct_chunk_encode(H5D_t *dset, hsize_t *write_size /*out*/, hsize_t *writ
     udata->offset[0] = 0; /* Filler */
     udata->offset[1] = sel_nbytes;
 
-    *write_size      = sel_nbytes + data_nbytes;
-    *write_buf_alloc = sel_nbytes + data_nbytes;
+    if (has_vlen) {
+        udata->offset[2] = sel_nbytes + data_nbytes;
+    }
+
+    *write_size      = (hsize_t)write_nbytes;
+    *write_buf_alloc = (hsize_t)write_nbytes;
     *write_buf       = tot_buf;
 
 done:
     if (data_buf)
         data_buf = H5MM_xfree(data_buf);
+
+    if (vl_buf)
+        vl_buf = H5MM_xfree(vl_buf);
+
+    if (vl_image)
+        vl_image = H5MM_xfree(vl_image);
 
     if (ret_value < 0 && tot_buf)
         tot_buf = H5MM_xfree(tot_buf);
@@ -2151,8 +2635,21 @@ done:
  * NOTE:  --chunk_encode: fill in udata: offset, unfilt_size, filt_mask,
  * NOTE:  --chunk_insert: fill in udata: addr, nbytes, chunk_idx
  *
- * NOTE: Only handle two sections for now
  *
+ *
+ * Updated:     Added support for three-section VL structured chunks.
+ *              For VL datatypes, the fixed section contains chunk-local
+ *              descriptors and the VL section contains the serialized local
+ *              heap set. Metadata checksums and configured filters are applied
+ *              independently to the fixed and VL sections. The VL boundary is
+ *              recorded in udata->offset[H5_SECTION_VL].
+ *
+ *              This function retains its destructive in-place behavior. After
+ *              constructing the encoded selection/fixed/VL image, it releases
+ *              the decoded selection, dataspace, local heap set, and chunk
+ *              wrapper.
+ *
+ *                                              -- AZO   9/16/26
  *-------------------------------------------------------------------------
  */
 static herr_t
@@ -2169,18 +2666,37 @@ H5D__struct_chunk_encode_in_place(H5D_t *dset, size_t *write_size /*out*/, bool 
     H5D_chunk_cache_mem_t *tmp;
     hsize_t                nelmts;
     size_t                 type_size;
-    herr_t                 ret_value = SUCCEED; /* Return value */
+    void                  *vl_buf        = NULL; /* Temporary encoded VL section */
+    uint8_t               *vl_image      = NULL; /* Image returned by H5HG encoder */
+    size_t                 vl_nbytes     = 0;
+    size_t                 vl_alloc_size = 0;
+    size_t                 write_nbytes  = 0;
+    hbool_t                has_vlen      = false;
+    herr_t                 ret_value     = SUCCEED; /* Return value */
 
     FUNC_ENTER_PACKAGE
 
     /* Sanity checks */
     assert(dset);
 
+    /*
+     * STRUCT_CHUNK_SECTION_COUNT_ASSUMPTION: The current format uses two
+     * sections for fixed-size data and three for data containing VL values.
+     * Revisit this inference if new section kinds, multiple VL sections,
+     * or a dense VL layout are introduced.
+     */
+    if (dset->shared->layout.storage.u.struct_chunk.nsects == 2) {
+        has_vlen = false;
+    }
+    else if (dset->shared->layout.storage.u.struct_chunk.nsects == H5_SECTION_NUM) {
+        has_vlen = true;
+    }
+    else
+        HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL, "invalid structured chunk section count");
+
     pline = &(dset->shared->dcpl_cache.stc_pline);
     if (pline && pline->tot_filt_nsects)
         filtered = true;
-
-    /* Determine size of selection dataspace */
 
     /* Determine size of selection dataspace */
     if (H5S_encode(chk->sel_space, &sel_p, &chk->sel_nbytes) < 0)
@@ -2215,6 +2731,66 @@ H5D__struct_chunk_encode_in_place(H5D_t *dset, size_t *write_size /*out*/, bool 
     assert(nelmts * type_size == chk->data_nbytes);
     assert(chk->data_alloc_size >= chk->data_nbytes);
 
+    /*
+     * For a VL chunk, the fixed section contains descriptors and therefore
+     * receives its own metadata checksum.
+     */
+    if (has_vlen) {
+        if (chk->data_nbytes > SIZE_MAX - H5_SIZEOF_CHKSUM)
+            HGOTO_ERROR(H5E_DATASET, H5E_OVERFLOW, FAIL, "encoded fixed section size overflow");
+
+        if (NULL == (chk->data_buf = H5MM_realloc(chk->data_buf, chk->data_nbytes + H5_SIZEOF_CHKSUM)))
+            HGOTO_ERROR(H5E_RESOURCE, H5E_CANTALLOC, FAIL, "unable to extend encoded fixed section");
+
+        chk->data_alloc_size = chk->data_nbytes + H5_SIZEOF_CHKSUM;
+
+        metadata_chksum = H5_checksum_metadata(chk->data_buf, chk->data_nbytes, 0);
+
+        p = (uint8_t *)chk->data_buf + chk->data_nbytes;
+        UINT32ENCODE(p, metadata_chksum);
+
+        chk->data_nbytes += H5_SIZEOF_CHKSUM;
+    }
+
+    /*
+     * Encode the chunk-local heap set as the third section. A NULL or
+     * logically empty heap set produces a zero-length VL section.
+     */
+    if (has_vlen) {
+        if (H5HG__encode_local_heapset(dset->oloc.file, chk->vl_heapset, &vl_image, &vl_nbytes) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_CANTENCODE, FAIL, "unable to encode chunk-local VL heap set");
+
+        vl_buf   = vl_image;
+        vl_image = NULL;
+
+        /*
+         * A nonempty VL section is metadata and therefore receives its own
+         * checksum. A zero-length section remains exactly zero bytes.
+         */
+        if (vl_nbytes > 0) {
+            void  *new_vl_buf;
+            size_t new_vl_size;
+
+            if (vl_nbytes > SIZE_MAX - H5_SIZEOF_CHKSUM)
+                HGOTO_ERROR(H5E_DATASET, H5E_OVERFLOW, FAIL, "encoded VL section size overflow");
+
+            new_vl_size = vl_nbytes + H5_SIZEOF_CHKSUM;
+
+            if (NULL == (new_vl_buf = H5MM_realloc(vl_buf, new_vl_size)))
+                HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, FAIL, "unable to extend encoded VL section");
+
+            vl_buf        = new_vl_buf;
+            vl_alloc_size = new_vl_size;
+
+            metadata_chksum = H5_checksum_metadata(vl_buf, vl_nbytes, 0);
+
+            p = (uint8_t *)vl_buf + vl_nbytes;
+            UINT32ENCODE(p, metadata_chksum);
+
+            vl_nbytes += H5_SIZEOF_CHKSUM;
+        }
+    }
+
     /* Compression */
     if (filtered) {
         H5Z_EDC_t              err_detect; /* Error detection info */
@@ -2224,6 +2800,10 @@ H5D__struct_chunk_encode_in_place(H5D_t *dset, size_t *write_size /*out*/, bool 
 
         udata->unfilt_size[0] = chk->sel_nbytes;
         udata->unfilt_size[1] = chk->data_nbytes;
+
+        if (has_vlen) {
+            udata->unfilt_size[2] = vl_nbytes;
+        }
 
         if (!partial_bound) {
 
@@ -2252,6 +2832,23 @@ H5D__struct_chunk_encode_in_place(H5D_t *dset, size_t *write_size /*out*/, bool 
                             break;
 
                         case H5_SECTION_VL:
+                            if (!has_vlen)
+                                HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL,
+                                            "VL filter configured for non-VL structured chunk");
+
+                            /*
+                             * A zero-length VL section has no encoded bytes and
+                             * therefore has nothing to filter.
+                             */
+                            if (vl_nbytes > 0) {
+                                if (H5Z_apply_filters(filt_sect->nused, filt_sect->filter, 0,
+                                                      &udata->filt_mask[2], err_detect, filter_cb, &vl_nbytes,
+                                                      &vl_alloc_size, &vl_buf) < 0)
+                                    HGOTO_ERROR(H5E_DATASET, H5E_CANTFILTER, FAIL,
+                                                "VL-section filter pipeline failed");
+                            }
+                            break;
+
                         case H5_SECTION_NUM:
                         default:
                             assert(0 && "Unknown action?!?");
@@ -2262,8 +2859,26 @@ H5D__struct_chunk_encode_in_place(H5D_t *dset, size_t *write_size /*out*/, bool 
         }
     }
 
-    /* Realloc chk->data_buf to provide space for encoded selection and data */
-    if (NULL == (chk->data_buf = H5MM_realloc(chk->data_buf, chk->sel_nbytes + chk->data_nbytes)))
+    if (chk->sel_nbytes > SIZE_MAX - chk->data_nbytes)
+        HGOTO_ERROR(H5E_DATASET, H5E_OVERFLOW, FAIL, "structured chunk encoded size overflow");
+
+    write_nbytes = chk->sel_nbytes + chk->data_nbytes;
+
+    if (has_vlen) {
+        if (vl_nbytes > SIZE_MAX - write_nbytes)
+            HGOTO_ERROR(H5E_DATASET, H5E_OVERFLOW, FAIL, "structured chunk encoded size overflow");
+
+        write_nbytes += vl_nbytes;
+    }
+
+    /*
+     * Assemble a contiguous encoded image by growing the fixed-data buffer,
+     * shifting its contents, and copying the selection and VL sections.
+     * These moves and copies remain necessary for the current contiguous
+     * output interface. A future section-level vector-write interface could
+     * submit the separate buffers without assembling this combined image.
+     */
+    if (NULL == (chk->data_buf = H5MM_realloc(chk->data_buf, write_nbytes)))
         HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, FAIL, "memory reallocation failed for data chunk");
 
     /* Shift data values to the right to provide space for encoded selection */
@@ -2271,11 +2886,19 @@ H5D__struct_chunk_encode_in_place(H5D_t *dset, size_t *write_size /*out*/, bool 
 
     H5MM_memcpy(chk->data_buf, chk->sel_buf, chk->sel_nbytes);
 
+    if (has_vlen && vl_nbytes > 0) {
+        H5MM_memcpy((uint8_t *)chk->data_buf + chk->sel_nbytes + chk->data_nbytes, vl_buf, vl_nbytes);
+    }
+
     tmp = chk;
 
     *chunk           = chk->data_buf;
-    *write_size      = (chk->sel_nbytes + chk->data_nbytes);
+    *write_size      = write_nbytes;
     udata->offset[1] = chk->sel_nbytes;
+
+    if (has_vlen) {
+        udata->offset[2] = chk->sel_nbytes + chk->data_nbytes;
+    }
 
     /* Free chk->sel_buf */
     chk->sel_buf    = H5MM_xfree(chk->sel_buf);
@@ -2285,9 +2908,24 @@ H5D__struct_chunk_encode_in_place(H5D_t *dset, size_t *write_size /*out*/, bool 
     if (chk->sel_space && H5S_close(chk->sel_space) < 0)
         HGOTO_ERROR(H5E_DATASET, H5E_CANTRELEASE, FAIL, "can't release dataspace for encoded selection");
 
+    chk->sel_space = NULL;
+
+    if (chk->vl_heapset) {
+        if (H5HG__free_local_heapset(chk->vl_heapset) < 0)
+            HGOTO_ERROR(H5E_HEAP, H5E_CANTFREE, FAIL, "unable to free encoded chunk-local VL heap set");
+
+        chk->vl_heapset = NULL;
+    }
+
     tmp = H5MM_xfree(tmp);
 
 done:
+    if (vl_buf)
+        vl_buf = H5MM_xfree(vl_buf);
+
+    if (vl_image)
+        vl_image = H5MM_xfree(vl_image);
+
     FUNC_LEAVE_NOAPI(ret_value)
 } /* H5D__struct_chunk_encode_in_place() */
 
@@ -2307,6 +2945,19 @@ done:
  *
  * Return:      Non-negative on success/Negative on failure
  *
+ * Updated:     Fully decoded structured chunks containing variable-length
+ *              data own a chunk-local H5HG heap set in addition to their
+ *              selection and fixed-data buffers. Full eviction now explicitly
+ *              frees that heap set so all decoded VL payloads and associated
+ *              heap allocations are released with the cached chunk.
+ *
+ *              The heap-set pointer may be NULL for non-VL chunks and for
+ *              metadata-only intermediate objects, so cleanup remains valid
+ *              for every structured-chunk representation accepted by this
+ *              callback. The pointer is cleared after a successful release to
+ *              make the ownership transition explicit.
+ *
+ *                                              -- AZO   9/17/26
  *-------------------------------------------------------------------------
  */
 static herr_t
@@ -2328,6 +2979,18 @@ H5D__struct_chunk_evict(H5D_t *dset, void *chunk, void *udata)
     /* Close the encoded dataspace */
     if (chk->sel_space && H5S_close(chk->sel_space) < 0)
         HGOTO_ERROR(H5E_DATASET, H5E_CANTRELEASE, FAIL, "can't release dataspace for encoded selection");
+
+    /*
+     * Free the chunk-local VL heap set. Metadata-only decoded chunks and
+     * structured chunks without VL data leave this field NULL.
+     */
+    if (chk->vl_heapset) {
+
+        if (H5HG__free_local_heapset(chk->vl_heapset) < 0)
+            HGOTO_ERROR(H5E_HEAP, H5E_CANTFREE, FAIL, "unable to free chunk-local VL heap set");
+
+        chk->vl_heapset = NULL;
+    }
 
     /* Free the chunk memory cache info structure */
     chk = H5MM_xfree(chk);
@@ -2482,6 +3145,19 @@ done:
  * Return:
  *   SUCCEED when eligibility is determined and, when possible, the vector
  *   is produced; FAIL on an internal translation or allocation error.
+ *
+ * Updated:     Structured chunks containing variable-length data cannot use
+ *              direct vector I/O. Their fixed section contains chunk-local
+ *              descriptors whose payloads are owned by the decoded chunk's
+ *              H5HG heap set. Such reads must therefore pass through the
+ *              resident structured-chunk representation and its chunk-local
+ *              VL datatype-conversion callbacks.
+ *
+ *              The datatype is checked before constructing an I/O vector. If
+ *              it contains VL data, VECTOR_POSSIBLE remains false so the SCC
+ *              uses the decoded-value read path instead.
+ *
+ *                                              -- AZO   9/19/26
  *-------------------------------------------------------------------------
  */
 static herr_t
@@ -2513,7 +3189,8 @@ H5D__struct_chunk_vector_read(H5D_t *dset, haddr_t addr, const H5S_t *file_space
     H5S_t                  *serial_values_space = NULL;
     H5S_t                  *serial_file_space   = NULL;
     H5_flexible_const_ptr_t flex_selection;
-    herr_t                  ret_value = SUCCEED;
+    htri_t                  has_vlen_type = false;
+    herr_t                  ret_value     = SUCCEED;
 
     FUNC_ENTER_PACKAGE
 
@@ -2525,6 +3202,21 @@ H5D__struct_chunk_vector_read(H5D_t *dset, haddr_t addr, const H5S_t *file_space
 
     /* Sanity checks */
     assert(dset);
+
+    /*
+     * Chunk-local VL values cannot use the direct vector-I/O path.
+     *
+     * The fixed section contains descriptors whose payloads live in the
+     * chunk-local H5HG heap set. Reads and writes must therefore pass through
+     * the decoded structured-chunk representation and the H5T chunk-local VL
+     * conversion callbacks.
+     */
+    if ((has_vlen_type = H5T_detect_class(dset->shared->type, H5T_VLEN, false)) < 0)
+        HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL, "unable to detect VL datatype");
+
+    if (has_vlen_type) {
+        HGOTO_DONE(SUCCEED);
+    }
 
     if (chk == NULL) {
         *require_values = true;
@@ -2727,7 +3419,7 @@ done:
  *   submitted or completed. The caller owns the returned OFFSETS and SIZES
  *   arrays and is responsible for releasing them.
  *
-     The vector-read and vector-write callbacks currently perform the same
+ *   The vector-read and vector-write callbacks currently perform the same
  *   selection-to-file-range translation and are intentionally retained as
  *   separate callbacks while their eventual SCC read/write uses remain under
  *   development. Once those use cases and their eligibility requirements are
@@ -2737,6 +3429,19 @@ done:
  * Return:
  *   SUCCEED when eligibility is determined and, when possible, the vector
  *   is produced; FAIL on an internal translation or allocation error.
+ *
+ * Updated:     Structured chunks containing variable-length data cannot use
+ *              direct vector I/O. Their fixed section contains chunk-local
+ *              descriptors whose payloads are owned by the decoded chunk's
+ *              H5HG heap set. Such writes must therefore pass through the
+ *              resident structured-chunk representation and its chunk-local
+ *              VL datatype-conversion callbacks.
+ *
+ *              The datatype is checked before constructing an I/O vector. If
+ *              it contains VL data, VECTOR_POSSIBLE remains false so the SCC
+ *              uses the decoded-value write path instead.
+ *
+ *                                              -- AZO   9/19/26
  *-------------------------------------------------------------------------
  */
 static herr_t
@@ -2767,7 +3472,8 @@ H5D__struct_chunk_vector_write(H5D_t *dset, haddr_t addr, const H5S_t *file_spac
     H5S_t                  *serial_values_space = NULL;
     H5S_t                  *serial_file_space   = NULL;
     H5_flexible_const_ptr_t flex_selection;
-    herr_t                  ret_value = SUCCEED;
+    htri_t                  has_vlen_type = false;
+    herr_t                  ret_value     = SUCCEED;
 
     FUNC_ENTER_PACKAGE
 
@@ -2779,6 +3485,21 @@ H5D__struct_chunk_vector_write(H5D_t *dset, haddr_t addr, const H5S_t *file_spac
 
     /* Sanity checks */
     assert(dset);
+
+    /*
+     * Chunk-local VL values cannot use the direct vector-I/O path.
+     *
+     * The fixed section contains descriptors whose payloads live in the
+     * chunk-local H5HG heap set. Reads and writes must therefore pass through
+     * the decoded structured-chunk representation and the H5T chunk-local VL
+     * conversion callbacks.
+     */
+    if ((has_vlen_type = H5T_detect_class(dset->shared->type, H5T_VLEN, false)) < 0)
+        HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL, "unable to detect VL datatype");
+
+    if (has_vlen_type) {
+        HGOTO_DONE(SUCCEED);
+    }
 
     if (chk == NULL) {
         *require_values = true;
@@ -2977,6 +3698,28 @@ done:
  *
  * NOTE: [udata] not used??
  *
+ * Updated:     Added support for reading variable-length values stored in a
+ *              structured chunk's local H5HG heap set. For VL datatypes, a
+ *              private file-side datatype is prepared whose VL callbacks use
+ *              a chunk-local conversion context rather than the normal
+ *              file-wide VL storage backend.
+ *
+ *              VL reads use dedicated strip-mined conversion and background
+ *              buffers and are forced out of place because conversion creates
+ *              memory-side VL payloads. The fixed descriptors are gathered
+ *              from the decoded chunk and converted through the chunk-local
+ *              datatype path, which resolves their referenced payloads from
+ *              the chunk's heap set.
+ *
+ *              The dedicated VL background buffer is passed to the conversion
+ *              when required, including for compound datatypes containing VL
+ *              members. This is necessary because compound conversion may
+ *              require a valid background value for members that are not
+ *              overwritten during conversion. The existing non-VL conversion
+ *              and optimized compound paths remain unchanged.
+ *
+ *                                              -- AZO   9/19/26
+ *
  *-------------------------------------------------------------------------
  */
 static herr_t
@@ -3009,6 +3752,18 @@ H5D__struct_chunk_scatter_mem(H5D_dset_io_info_t *dset_info, H5D_io_type_info_t 
     H5_flexible_const_ptr_t      flex_fspace;
     herr_t                       ret_value = SUCCEED; /* Return value     */
 
+    H5T_t                *chunk_file_type = NULL;
+    H5T_path_t           *chunk_tpath     = NULL;
+    H5HG_local_heapset_t *read_heapset    = NULL;
+    H5T_vlen_chunk_ctx_t  vl_ctx;
+    size_t                ref_nbytes    = 0;
+    htri_t                has_vlen_type = false;
+
+    void  *vl_tconv_buf    = NULL;
+    void  *vl_bkg_buf      = NULL;
+    size_t vl_strip_nelmts = 0;
+    size_t vl_type_size;
+
     FUNC_ENTER_PACKAGE
 
     assert(dset_info);
@@ -3029,6 +3784,53 @@ H5D__struct_chunk_scatter_mem(H5D_dset_io_info_t *dset_info, H5D_io_type_info_t 
 
     mem_type_size  = dset_info->type_info.dst_type_size;
     file_type_size = dset_info->type_info.src_type_size;
+
+    /* On read, SRC_TYPE is the file-side datatype. */
+    if ((has_vlen_type = H5T_detect_class(dset_info->type_info.src_type, H5T_VLEN, false)) < 0)
+        HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL, "unable to detect VL datatype");
+
+    if (has_vlen_type) {
+        /*
+         * Build a private file datatype whose VL nodes resolve through this
+         * structured chunk rather than the normal file-wide blob backend.
+         */
+        if (H5D__struct_chunk_prepare_vlen_type(dset_info->dset, dset_info->type_info.src_type,
+                                                dset_info->type_info.dst_type, true, &chunk_file_type,
+                                                &chunk_tpath, &ref_nbytes) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "unable to prepare chunk-local VL read conversion");
+
+        H5_CHECK_OVERFLOW(nelmts, hsize_t, size_t);
+
+        vl_strip_nelmts = MIN((size_t)nelmts, (size_t)1024);
+        vl_type_size    = MAX(file_type_size, mem_type_size);
+
+        if (vl_type_size == 0 || vl_strip_nelmts > SIZE_MAX / vl_type_size)
+            HGOTO_ERROR(H5E_DATASET, H5E_OVERFLOW, FAIL,
+                        "chunk-local VL read conversion buffer size overflow");
+
+        if (NULL == (vl_tconv_buf = H5MM_malloc(vl_strip_nelmts * vl_type_size)))
+            HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, FAIL,
+                        "unable to allocate chunk-local VL read conversion buffer");
+
+        if (dset_info->type_info.need_bkg != H5T_BKG_NO) {
+            if (NULL == (vl_bkg_buf = H5MM_calloc(vl_strip_nelmts * vl_type_size)))
+                HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, FAIL,
+                            "unable to allocate chunk-local VL read background buffer");
+        }
+
+        /*
+         * READ does not create heap sets. Use a local pointer variable so the
+         * H5T context can retain its existing H5HG_local_heapset_t ** interface
+         * without casting away CHK's const qualification.
+         */
+        read_heapset = chk->vl_heapset;
+
+        memset(&vl_ctx, 0, sizeof(vl_ctx));
+
+        vl_ctx.f          = dset_info->dset->oloc.file;
+        vl_ctx.heapset    = &read_heapset;
+        vl_ctx.ref_nbytes = ref_nbytes;
+    }
 
     flex_mspace.cvp = mem_space;
     flex_fspace.cvp = file_space;
@@ -3075,7 +3877,7 @@ H5D__struct_chunk_scatter_mem(H5D_dset_io_info_t *dset_info, H5D_io_type_info_t 
      * into the application's buffer.
      */
 
-    if (dset_info->type_info.is_xform_noop && dset_info->type_info.is_conv_noop) {
+    if (!has_vlen_type && dset_info->type_info.is_xform_noop && dset_info->type_info.is_conv_noop) {
 
         size_t selected_nelmts;
         size_t packed_buf_size;
@@ -3155,12 +3957,16 @@ H5D__struct_chunk_scatter_mem(H5D_dset_io_info_t *dset_info, H5D_io_type_info_t 
                 }
             }
         }
+        /* VL conversion creates memory-side payloads; use the conversion buffer. */
+        if (has_vlen_type) {
+            in_place_tconv = false;
+        }
 
         /* Check if we should disable in-place type conversion for performance.  Do so if we can use the
          * optimized compound read function, and the either entire I/O operation can fit in the type
          * conversion buffer or we need to use a background buffer (and therefore could not do the I/O in one
          * operation with in-place conversion * anyways). */
-        if (in_place_tconv && H5D__SCATGATH_USE_CMPD_OPT_READ(dset_info, false) &&
+        if (!has_vlen_type && H5D__SCATGATH_USE_CMPD_OPT_READ(dset_info, false) &&
             (dset_info->type_info.need_bkg || (nelmts <= dset_info->type_info.request_nelmts)))
             in_place_tconv = false;
 
@@ -3205,10 +4011,15 @@ H5D__struct_chunk_scatter_mem(H5D_dset_io_info_t *dset_info, H5D_io_type_info_t 
             }
             else {
                 /* Do type conversion using intermediate buffer */
-                tmp_buf = io_type_info->tconv_buf;
-
-                /* Go figure out how many elements to read from the file */
-                smine_nelmts = (size_t)MIN(dset_info->type_info.request_nelmts, (nelmts - smine_start));
+                if (has_vlen_type) {
+                    tmp_buf      = vl_tconv_buf;
+                    smine_nelmts = (size_t)MIN((hsize_t)vl_strip_nelmts, nelmts - smine_start);
+                }
+                else {
+                    tmp_buf = io_type_info->tconv_buf;
+                    /* Go figure out how many elements to read from the file */
+                    smine_nelmts = (size_t)MIN(dset_info->type_info.request_nelmts, nelmts - smine_start);
+                }
             }
 
             /*
@@ -3221,7 +4032,8 @@ H5D__struct_chunk_scatter_mem(H5D_dset_io_info_t *dset_info, H5D_io_type_info_t 
              * the read so the read buffer doesn't get wiped out if we're using in-place type conversion */
             if ((H5T_BKG_YES == dset_info->type_info.need_bkg) &&
                 !H5D__SCATGATH_USE_CMPD_OPT_READ(dset_info, in_place_tconv)) {
-                n = H5D__gather_mem(buf, bkg_iter, smine_nelmts, io_type_info->bkg_buf /*out*/);
+                n = H5D__gather_mem(buf, bkg_iter, smine_nelmts,
+                                    has_vlen_type ? vl_bkg_buf : io_type_info->bkg_buf);
                 if (n != smine_nelmts)
                     HGOTO_ERROR(H5E_IO, H5E_READERROR, FAIL, "mem gather failed");
             }
@@ -3237,7 +4049,7 @@ H5D__struct_chunk_scatter_mem(H5D_dset_io_info_t *dset_info, H5D_io_type_info_t 
              * and no conversion is needed, copy the data directly into user's buffer and
              * bypass the rest of steps.
              */
-            if (H5D__SCATGATH_USE_CMPD_OPT_READ(dset_info, in_place_tconv)) {
+            if (!has_vlen_type && H5D__SCATGATH_USE_CMPD_OPT_READ(dset_info, in_place_tconv)) {
                 if (H5D__compound_opt_read(smine_nelmts, mem_iter, &dset_info->type_info, tmp_buf,
                                            buf /*out*/) < 0)
                     HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "datatype conversion failed");
@@ -3246,10 +4058,19 @@ H5D__struct_chunk_scatter_mem(H5D_dset_io_info_t *dset_info, H5D_io_type_info_t 
                 /*
                  * Perform datatype conversion.
                  */
-                if (H5T_convert(dset_info->type_info.tpath, dset_info->type_info.src_type,
-                                dset_info->type_info.dst_type, smine_nelmts, (size_t)0, (size_t)0, tmp_buf,
-                                io_type_info->bkg_buf) < 0)
-                    HGOTO_ERROR(H5E_DATASET, H5E_CANTCONVERT, FAIL, "datatype conversion failed");
+                if (has_vlen_type) {
+                    if (H5D__struct_chunk_vlen_convert(&vl_ctx, chunk_tpath, chunk_file_type,
+                                                       dset_info->type_info.dst_type, smine_nelmts, tmp_buf,
+                                                       vl_bkg_buf) < 0)
+                        HGOTO_ERROR(H5E_DATASET, H5E_CANTCONVERT, FAIL,
+                                    "chunk-local VL read conversion failed");
+                }
+                else {
+                    if (H5T_convert(dset_info->type_info.tpath, dset_info->type_info.src_type,
+                                    dset_info->type_info.dst_type, smine_nelmts, (size_t)0, (size_t)0,
+                                    tmp_buf, io_type_info->bkg_buf) < 0)
+                        HGOTO_ERROR(H5E_DATASET, H5E_CANTCONVERT, FAIL, "datatype conversion failed");
+                }
 
                 /* Do the data transform after the conversion (since we're using type mem_type) */
                 if (!dset_info->type_info.is_xform_noop) {
@@ -3274,6 +4095,12 @@ H5D__struct_chunk_scatter_mem(H5D_dset_io_info_t *dset_info, H5D_io_type_info_t 
     }
 
 done:
+
+    if (chunk_file_type) {
+        if (H5T_close_real(chunk_file_type) < 0)
+            HDONE_ERROR(H5E_DATATYPE, H5E_CANTCLOSEOBJ, FAIL,
+                        "unable to release chunk-local VL file datatype");
+    }
     /* Release selection iterators */
     if (file_iter_init && H5S_SELECT_ITER_RELEASE(file_iter) < 0)
         HDONE_ERROR(H5E_DATASET, H5E_CANTFREE, FAIL, "Can't release selection iterator");
@@ -3296,6 +4123,9 @@ done:
 
     if (packed_buf)
         packed_buf = H5MM_xfree(packed_buf);
+
+    vl_tconv_buf = H5MM_xfree(vl_tconv_buf);
+    vl_bkg_buf   = H5MM_xfree(vl_bkg_buf);
 
     FUNC_LEAVE_NOAPI(ret_value)
 } /* H5D__struct_chunk_scatter_mem() */
@@ -3322,6 +4152,23 @@ done:
  * NOTE: [udata] not used??
  * NOTE: Not sure about my tracking of [nbytes], [alloc_size], and [alloc_size_total]
  *
+ * Updated:    Adds serial conversion of memory-side VL values into fixed
+ *             structured-chunk descriptors backed by a chunk-local H5HG
+ *             heap set.
+ *
+ *             Heap-set changes are staged so failed conversion does not
+ *             publish partially constructed VL storage. Existing fixed
+ *             descriptors are gathered as conversion background so replacing
+ *             a VL value also releases its previous chunk-local heap object.
+ *
+ *             The VL path supplies its own conversion and background buffers
+ *             because the normal H5D conversion setup may classify logically
+ *             identical source and destination datatypes as a no-op and
+ *             provide zero strip-mining capacity. The resulting heap-set
+ *             allocation is included in SCC resident-memory accounting.
+ *
+ *                                    -- AZO   09/17/26
+ *
  *-------------------------------------------------------------------------
  */
 static herr_t
@@ -3341,8 +4188,8 @@ H5D__struct_chunk_gather_mem(H5D_dset_io_info_t *dset_info, H5D_io_type_info_t *
     H5S_sel_iter_t         *sel_iter       = NULL;  /* Memory selection iteration info*/
     bool                    sel_iter_init  = false; /* Memory selection iteration info has been initialized */
     bool                    bkg_iter_init  = false; /* Memory selection iteration info has been initialized */
-    hsize_t                 smine_start;            /* Strip mine start loc	*/
-    size_t                  smine_nelmts;           /* Elements per strip	*/
+    hsize_t                 smine_start;            /* Strip mine start loc */
+    size_t                  smine_nelmts;           /* Elements per strip */
     hsize_t                 nelmts; /* Number of elements selected in file & memory dataspaces */
     size_t                  selected_nelmts;
     size_t                  mem_type_size;
@@ -3355,7 +4202,30 @@ H5D__struct_chunk_gather_mem(H5D_dset_io_info_t *dset_info, H5D_io_type_info_t *
     hsize_t                 scat_buf_size;
     H5_flexible_const_ptr_t flex_mspace;
     H5_flexible_const_ptr_t flex_fspace;
-    herr_t                  ret_value = SUCCEED; /* Return value		*/
+    H5T_t                  *chunk_file_type = NULL;   /* Chunk-file datatype using local VL references */
+    H5T_path_t             *chunk_tpath     = NULL;   /* Conversion path to the chunk-file datatype */
+    H5T_vlen_chunk_ctx_t    vl_ctx;                   /* Context used to create chunk-local VL objects */
+    H5HG_local_heapset_t   *staged_heapset = NULL;    /* Working copy of the chunk-local VL heap set */
+    H5HG_local_heapset_t   *old_heapset    = NULL;    /* Replaced VL heap set awaiting release */
+    size_t                  ref_nbytes     = 0;       /* Encoded size of one chunk-local VL reference */
+    htri_t                  has_vlen_type  = false;   /* Whether the destination datatype contains VL data */
+    herr_t                  ret_value      = SUCCEED; /* Return value */
+
+    void  *vl_tconv_buf    = NULL; /* Private conversion buffer for chunk-local VL writes */
+    void  *vl_bkg_buf      = NULL; /* Existing file descriptors used during VL replacement */
+    size_t vl_strip_nelmts = 0;    /* Maximum VL elements converted in one iteration */
+    size_t vl_buf_size     = 0;    /* Allocation size of each private VL buffer */
+
+    H5S_t                *staged_sel_space = NULL;
+    H5S_t                *old_sel_space    = NULL;
+    void                 *staged_data_buf  = NULL;
+    void                 *old_data_buf     = NULL;
+    H5D_chunk_cache_mem_t accounting_chk;
+    size_t                staged_data_size = 0;
+    size_t                new_nbytes       = 0;
+    size_t                new_buffer_alloc = 0;
+    size_t                new_total_alloc  = 0;
+    htri_t                heapset_empty    = false;
 
     FUNC_ENTER_PACKAGE
 
@@ -3386,6 +4256,58 @@ H5D__struct_chunk_gather_mem(H5D_dset_io_info_t *dset_info, H5D_io_type_info_t *
 
     mem_type_size  = dset_info->type_info.src_type_size;
     file_type_size = dset_info->type_info.dst_type_size;
+
+    /* Detect whether the file datatype has a VL component */
+    if ((has_vlen_type = H5T_detect_class(dset_info->type_info.dst_type, H5T_VLEN, false)) < 0)
+        HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL, "unable to detect vlen datatypes");
+
+    if (has_vlen_type) {
+        if (H5D__struct_chunk_prepare_vlen_type(dset_info->dset, dset_info->type_info.dst_type,
+                                                dset_info->type_info.src_type, false, &chunk_file_type,
+                                                &chunk_tpath, &ref_nbytes) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "unable to prepare chunk-local VL write conversion");
+
+        /*
+         * This copies the entire heap set, including payloads that the write
+         * will leave unchanged. It lets conversion modify private storage and
+         * preserves the resident descriptors and heap set if staging fails.
+         * Reducing that copy would require a way to stage only changed payloads
+         * while keeping descriptor references and failure cleanup consistent.
+         */
+        if (H5HG__copy_local_heapset(dset_info->dset->oloc.file, chk->vl_heapset, &staged_heapset) < 0)
+            HGOTO_ERROR(H5E_HEAP, H5E_CANTCOPY, FAIL, "unable to copy chunk-local VL heap set");
+
+        memset(&vl_ctx, 0, sizeof(vl_ctx));
+        vl_ctx.f          = dset_info->dset->oloc.file;
+        vl_ctx.heapset    = &staged_heapset;
+        vl_ctx.ref_nbytes = ref_nbytes;
+
+        /*
+         * The normal I/O path may classify this operation as a no-op
+         * conversion and therefore provide no conversion capacity. Chunk-local
+         * VL storage still requires conversion from the memory representation
+         * to fixed descriptors, so provide operation-local strip buffers.
+         */
+        vl_strip_nelmts = MIN(selected_nelmts, (size_t)1024);
+
+        if (vl_strip_nelmts == 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL,
+                        "chunk-local VL write has an empty conversion strip");
+
+        if (MAX(mem_type_size, file_type_size) == 0 ||
+            vl_strip_nelmts > SIZE_MAX / MAX(mem_type_size, file_type_size))
+            HGOTO_ERROR(H5E_RESOURCE, H5E_OVERFLOW, FAIL, "chunk-local VL conversion buffer size overflow");
+
+        vl_buf_size = vl_strip_nelmts * MAX(mem_type_size, file_type_size);
+
+        if (NULL == (vl_tconv_buf = H5MM_malloc(vl_buf_size)))
+            HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, FAIL,
+                        "unable to allocate chunk-local VL conversion buffer");
+
+        if (NULL == (vl_bkg_buf = H5MM_malloc(vl_buf_size)))
+            HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, FAIL,
+                        "unable to allocate chunk-local VL background buffer");
+    }
 
     flex_mspace.cvp = mem_space;
     flex_fspace.cvp = file_space;
@@ -3424,11 +4346,12 @@ H5D__struct_chunk_gather_mem(H5D_dset_io_info_t *dset_info, H5D_io_type_info_t *
             if (H5D__scatter_mem(chk->data_buf, sel_iter, sel_nelmts, data_scat_buf /*out*/) < 0)
                 HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "mem scatter failed");
 
-            if (sel_iter_init && H5S_SELECT_ITER_RELEASE(sel_iter) < 0)
-                HDONE_ERROR(H5E_DATASET, H5E_CANTFREE, FAIL, "Can't release selection iterator");
+            sel_iter_init = false;
 
-            if (sel_iter)
-                sel_iter = H5FL_FREE(H5S_sel_iter_t, sel_iter);
+            if (H5S_SELECT_ITER_RELEASE(sel_iter) < 0)
+                HGOTO_ERROR(H5E_DATASET, H5E_CANTFREE, FAIL, "unable to release selection iterator");
+
+            sel_iter = H5FL_FREE(H5S_sel_iter_t, sel_iter);
         }
     }
 
@@ -3437,7 +4360,7 @@ H5D__struct_chunk_gather_mem(H5D_dset_io_info_t *dset_info, H5D_io_type_info_t *
      * into the chunk buffer.
      */
 
-    if (dset_info->type_info.is_xform_noop && dset_info->type_info.is_conv_noop) {
+    if (!has_vlen_type && dset_info->type_info.is_xform_noop && dset_info->type_info.is_conv_noop) {
 
         size_t packed_buf_size = 0;
         size_t n;
@@ -3507,11 +4430,15 @@ H5D__struct_chunk_gather_mem(H5D_dset_io_info_t *dset_info, H5D_io_type_info_t *
             }
         }
 
+        /* Chunk-local VL conversion must not modify the application buffer. */
+        if (has_vlen_type)
+            in_place_tconv = false;
+
         /* Check if we should disable in-place type conversion for performance.  Do so if we can use the
          * optimized compound write function, and either entire I/O operation can fit in the type conversion
          * buffer or we need to use a background buffer (and therefore could not do the I/O in one operation
          * with in-place conversion * anyways). */
-        if (in_place_tconv && H5D__SCATGATH_USE_CMPD_OPT_WRITE(dset_info, false) &&
+        if (!has_vlen_type && in_place_tconv && H5D__SCATGATH_USE_CMPD_OPT_WRITE(dset_info, false) &&
             (dset_info->type_info.need_bkg || (nelmts <= dset_info->type_info.request_nelmts)))
             in_place_tconv = false;
 
@@ -3563,18 +4490,22 @@ H5D__struct_chunk_gather_mem(H5D_dset_io_info_t *dset_info, H5D_io_type_info_t *
                 tmp_buf = (uint8_t *)dset_info->buf.vp + buf_off + (smine_start * mem_type_size);
             }
             else {
-                /* Do type conversion using intermediate buffer */
-                tmp_buf = io_type_info->tconv_buf;
-
-                /* Go figure out how many elements to read from the file */
-                smine_nelmts = (size_t)MIN(dset_info->type_info.request_nelmts, (nelmts - smine_start));
-
                 /*
-                 * Gather data from application buffer into the datatype conversion
-                 * buffer. Also gather data from the file into the background buffer
-                 * if necessary.
+                 * Chunk-local VL conversion uses its own nonzero strip capacity.
+                 * The normal request count may be zero when H5D classified the
+                 * logical datatype conversion as a no-op.
                  */
+                if (has_vlen_type) {
+                    tmp_buf      = vl_tconv_buf;
+                    smine_nelmts = MIN(vl_strip_nelmts, selected_nelmts - (size_t)smine_start);
+                }
+                else {
+                    tmp_buf      = io_type_info->tconv_buf;
+                    smine_nelmts = (size_t)MIN(dset_info->type_info.request_nelmts, nelmts - smine_start);
+                }
+
                 n = H5D__gather_mem(buf, mem_iter, smine_nelmts, tmp_buf /*out*/);
+
                 if (n != smine_nelmts)
                     HGOTO_ERROR(H5E_IO, H5E_WRITEERROR, FAIL, "mem gather failed");
             }
@@ -3585,17 +4516,29 @@ H5D__struct_chunk_gather_mem(H5D_dset_io_info_t *dset_info, H5D_io_type_info_t *
              * is a subset of the destination, the optimization is done in conversion
              * function H5T_conv_struct_opt to protect the background data.
              */
-            if (H5D__SCATGATH_USE_CMPD_OPT_WRITE(dset_info, in_place_tconv)) {
+            if (!has_vlen_type && H5D__SCATGATH_USE_CMPD_OPT_WRITE(dset_info, in_place_tconv)) {
                 if (H5D__compound_opt_write(smine_nelmts, &dset_info->type_info, tmp_buf) < 0)
                     HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "datatype conversion failed");
 
             } /* end if */
             else {
-                if (H5T_BKG_YES == dset_info->type_info.need_bkg) {
+                /*
+                 * Chunk-local VL replacement always needs the previous file
+                 * descriptors. Their delete callbacks release any H5HG objects
+                 * being replaced, even when ordinary H5T conversion does not
+                 * request a background buffer.
+                 */
+                if (has_vlen_type) {
+                    n = H5D__gather_mem(data_scat_buf, bkg_iter, smine_nelmts, vl_bkg_buf /*out*/);
+                    if (n != smine_nelmts)
+                        HGOTO_ERROR(H5E_IO, H5E_READERROR, FAIL,
+                                    "unable to gather VL background descriptors");
+                }
+                else if (H5T_BKG_YES == dset_info->type_info.need_bkg) {
                     n = H5D__gather_mem(data_scat_buf, bkg_iter, smine_nelmts, io_type_info->bkg_buf /*out*/);
                     if (n != smine_nelmts)
                         HGOTO_ERROR(H5E_IO, H5E_READERROR, FAIL, "file gather failed");
-                } /* end if */
+                }
 
                 /* Do the data transform before the type conversion (since
                  * transforms must be done in the memory type). */
@@ -3614,9 +4557,16 @@ H5D__struct_chunk_gather_mem(H5D_dset_io_info_t *dset_info, H5D_io_type_info_t *
                 /*
                  * Perform datatype conversion.
                  */
-                if (H5T_convert(dset_info->type_info.tpath, dset_info->type_info.src_type,
-                                dset_info->type_info.dst_type, smine_nelmts, (size_t)0, (size_t)0, tmp_buf,
-                                io_type_info->bkg_buf) < 0)
+                if (has_vlen_type) {
+                    if (H5D__struct_chunk_vlen_convert(&vl_ctx, chunk_tpath, dset_info->type_info.src_type,
+                                                       chunk_file_type, smine_nelmts, tmp_buf,
+                                                       vl_bkg_buf) < 0)
+                        HGOTO_ERROR(H5E_DATASET, H5E_CANTCONVERT, FAIL,
+                                    "chunk-local VL datatype conversion failed");
+                }
+                else if (H5T_convert(dset_info->type_info.tpath, dset_info->type_info.src_type,
+                                     dset_info->type_info.dst_type, smine_nelmts, (size_t)0, (size_t)0,
+                                     tmp_buf, io_type_info->bkg_buf) < 0)
                     HGOTO_ERROR(H5E_DATASET, H5E_CANTCONVERT, FAIL, "datatype conversion failed");
             } /* end else */
 
@@ -3631,81 +4581,155 @@ H5D__struct_chunk_gather_mem(H5D_dset_io_info_t *dset_info, H5D_io_type_info_t *
     } /* end if */
 
     /*
-     *  Gather data in data_scat_buf to chk->data_buf according to chk->sel_space
+     * Build the replacement selection without changing the resident chunk.
+     * Keep the existing ALL-selection behavior.
      */
-    {
-        H5S_t  *sel_space;
-        hsize_t sel_nelmts;
-        hsize_t n;
-
-        /* Combine selections */
-        /* TBD: how about other types: H5S_SEL_NONE, H5S_SEL_POINTS */
-        if (chk->sel_space) {
-            if (H5S_GET_SELECT_TYPE(chk->sel_space) != H5S_SEL_ALL) {
-
-                if (NULL == (sel_space = H5S__combine_select(chk->sel_space, H5S_SELECT_OR, flex_fspace.vp)))
-                    HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "unable to get dataspace");
-                if (H5S_close(chk->sel_space) < 0)
-                    HGOTO_ERROR(H5E_DATASET, H5E_CANTRELEASE, FAIL, "can't release dataspace");
-
-                if (NULL == (chk->sel_space = H5S_copy(sel_space, false, true)))
-                    HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "unable to get dataspace");
-                if (H5S_close(sel_space) < 0)
-                    HGOTO_ERROR(H5E_DATASET, H5E_CANTRELEASE, FAIL, "can't release dataspace");
-            }
+    if (chk->sel_space) {
+        if (H5S_GET_SELECT_TYPE(chk->sel_space) == H5S_SEL_ALL) {
+            if (NULL == (staged_sel_space = H5S_copy(chk->sel_space, false, true)))
+                HGOTO_ERROR(H5E_DATASPACE, H5E_CANTCOPY, FAIL, "unable to copy chunk selection");
         }
         else {
-            if (NULL == (chk->sel_space = H5S_copy(file_space, false, true)))
-                HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "unable to get dataspace");
+            if (NULL ==
+                (staged_sel_space = H5S__combine_select(chk->sel_space, H5S_SELECT_OR, flex_fspace.vp)))
+                HGOTO_ERROR(H5E_DATASPACE, H5E_CANTINIT, FAIL, "unable to combine chunk selections");
         }
-
-        /* Get the number of elements in the selection */
-        sel_nelmts = H5S_GET_SELECT_NPOINTS(chk->sel_space);
-
-        /* Initialize the iterator */
-        if (NULL == (sel_iter = H5FL_MALLOC(H5S_sel_iter_t)))
-            HGOTO_ERROR(H5E_DATASET, H5E_CANTALLOC, FAIL, "can't allocate selection iterator");
-
-        if (H5S_select_iter_init(sel_iter, chk->sel_space, file_type_size, H5S_SEL_ITER_GET_SEQ_LIST_SORTED) <
-            0)
-            HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "unable to initialize selection iter information");
-        sel_iter_init = true;
-
-        /* Re-allocate the chk->data_buf */
-        chk->data_nbytes     = sel_nelmts * file_type_size;
-        chk->data_alloc_size = chk->data_nbytes;
-
-        if (NULL == (chk->data_buf = H5MM_realloc(chk->data_buf, chk->data_alloc_size)))
-            HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, FAIL, "memory allocation failed for the chunk");
-
-        /* Gather elements to chk->data_buf */
-        n = H5D__gather_mem(data_scat_buf, sel_iter, sel_nelmts, chk->data_buf /*out*/);
-        if (n != sel_nelmts)
-            HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "mem gather failed");
-
-        /* Free the iterator */
-        if (sel_iter_init) {
-            if (H5S_SELECT_ITER_RELEASE(sel_iter) < 0)
-                HDONE_ERROR(H5E_DATASET, H5E_CANTFREE, FAIL, "can't release chunk selection iterator");
-
-            sel_iter_init = false;
-        }
-
-        if (sel_iter)
-            sel_iter = H5FL_FREE(H5S_sel_iter_t, sel_iter);
-
-        // /* Free the buffer */
-        // if (data_scat_buf)
-        //     data_scat_buf = H5FL_BLK_FREE(scat_buf, data_scat_buf);
+    }
+    else {
+        if (NULL == (staged_sel_space = H5S_copy(file_space, false, true)))
+            HGOTO_ERROR(H5E_DATASPACE, H5E_CANTCOPY, FAIL, "unable to copy write selection");
     }
 
-    *nbytes += chk->sel_nbytes + chk->data_nbytes;
-    *alloc_size += chk->sel_alloc_size + chk->data_alloc_size;
+    /*
+     * Gather all resulting fixed records into a privately owned buffer.
+     */
+    {
+        hsize_t sel_nelmts;
+        size_t  staged_nelmts;
+        size_t  gathered_nelmts;
 
-    /* Authoritative resident allocation, without encoded-size double counting. */
-    *alloc_size_total = chk->sel_alloc_size + chk->data_alloc_size;
+        sel_nelmts = H5S_GET_SELECT_NPOINTS(staged_sel_space);
+
+        H5_CHECK_OVERFLOW(sel_nelmts, hsize_t, size_t);
+        staged_nelmts = (size_t)sel_nelmts;
+
+        if (file_type_size == 0 || staged_nelmts > SIZE_MAX / file_type_size)
+            HGOTO_ERROR(H5E_DATASET, H5E_OVERFLOW, FAIL, "staged chunk data size overflow");
+
+        staged_data_size = staged_nelmts * file_type_size;
+
+        /*
+         * A nonempty write must produce a nonempty resulting selection.
+         */
+        if (staged_nelmts == 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL, "nonempty write produced an empty chunk selection");
+
+        if (NULL == (staged_data_buf = H5MM_malloc(staged_data_size)))
+            HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, FAIL, "unable to allocate staged chunk data");
+
+        if (NULL == (sel_iter = H5FL_MALLOC(H5S_sel_iter_t)))
+            HGOTO_ERROR(H5E_DATASET, H5E_CANTALLOC, FAIL, "unable to allocate chunk selection iterator");
+
+        if (H5S_select_iter_init(sel_iter, staged_sel_space, file_type_size,
+                                 H5S_SEL_ITER_GET_SEQ_LIST_SORTED) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "unable to initialize chunk selection iterator");
+
+        sel_iter_init = true;
+
+        gathered_nelmts = H5D__gather_mem(data_scat_buf, sel_iter, staged_nelmts, staged_data_buf);
+
+        if (gathered_nelmts != staged_nelmts)
+            HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "unable to gather staged chunk data");
+
+        sel_iter_init = false;
+
+        if (H5S_SELECT_ITER_RELEASE(sel_iter) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_CANTFREE, FAIL, "unable to release chunk selection iterator");
+
+        sel_iter = H5FL_FREE(H5S_sel_iter_t, sel_iter);
+    }
+
+    /*
+     * H5HG retains the outer manager when its final object is removed.
+     * Normalize an empty staged heap set before publication.
+     */
+    if (has_vlen_type && staged_heapset) {
+        if ((heapset_empty = H5HG__is_empty_local_heapset(staged_heapset)) < 0)
+            HGOTO_ERROR(H5E_HEAP, H5E_CANTGET, FAIL, "unable to query staged heap-set emptiness");
+
+        if (heapset_empty) {
+            H5HG_local_heapset_t *empty_heapset = staged_heapset;
+
+            staged_heapset = NULL;
+
+            if (H5HG__free_local_heapset(empty_heapset) < 0)
+                HGOTO_ERROR(H5E_HEAP, H5E_CANTFREE, FAIL, "unable to free empty staged heap set");
+        }
+    }
+
+    /*
+     * Calculate every reported size before changing resident state.
+     * The accounting view borrows pointers; it owns no allocations.
+     */
+    accounting_chk = *chk;
+
+    accounting_chk.sel_space       = staged_sel_space;
+    accounting_chk.data_buf        = staged_data_buf;
+    accounting_chk.data_nbytes     = staged_data_size;
+    accounting_chk.data_alloc_size = staged_data_size;
+
+    if (has_vlen_type) {
+        accounting_chk.vl_heapset = staged_heapset;
+    }
+
+    if (accounting_chk.sel_nbytes > (SIZE_MAX - accounting_chk.data_nbytes))
+        HGOTO_ERROR(H5E_DATASET, H5E_OVERFLOW, FAIL, "structured chunk logical size overflow");
+
+    new_nbytes = accounting_chk.sel_nbytes + accounting_chk.data_nbytes;
+
+    if (accounting_chk.sel_alloc_size > SIZE_MAX - accounting_chk.data_alloc_size)
+        HGOTO_ERROR(H5E_DATASET, H5E_OVERFLOW, FAIL, "structured chunk buffer allocation overflow");
+
+    new_buffer_alloc = accounting_chk.sel_alloc_size + accounting_chk.data_alloc_size;
+
+    if (H5D__struct_chunk_get_alloc_size(&accounting_chk, &new_total_alloc) < 0)
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "unable to calculate staged chunk allocation");
+
+    /*
+     * Commit the matching selection, fixed records, and heap set.
+     * No fallible construction or accounting remains in this block.
+     */
+    old_sel_space = chk->sel_space;
+    old_data_buf  = chk->data_buf;
+
+    chk->sel_space       = staged_sel_space;
+    chk->data_buf        = staged_data_buf;
+    chk->data_nbytes     = staged_data_size;
+    chk->data_alloc_size = staged_data_size;
+
+    staged_sel_space = NULL;
+    staged_data_buf  = NULL;
+
+    if (has_vlen_type) {
+        old_heapset     = chk->vl_heapset;
+        chk->vl_heapset = staged_heapset;
+        staged_heapset  = NULL;
+    }
+
+    /*
+     * Return sizes of the replacement state, rather than adding another
+     * copy of the chunk's sizes to the caller's previous values.
+     */
+    *nbytes           = new_nbytes;
+    *alloc_size       = new_buffer_alloc;
+    *alloc_size_total = new_total_alloc;
 
 done:
+    if (chunk_file_type) {
+        if (H5T_close_real(chunk_file_type) < 0)
+            HDONE_ERROR(H5E_DATATYPE, H5E_CANTCLOSEOBJ, FAIL, "unable to close chunk-local VL file datatype");
+    }
+
     /* Release selection iterators */
     if (mem_iter_init && H5S_SELECT_ITER_RELEASE(mem_iter) < 0)
         HDONE_ERROR(H5E_DATASET, H5E_CANTFREE, FAIL, "Can't release selection iterator");
@@ -3722,6 +4746,9 @@ done:
     if (bkg_iter)
         bkg_iter = H5FL_FREE(H5S_sel_iter_t, bkg_iter);
 
+    if (sel_iter_init && H5S_SELECT_ITER_RELEASE(sel_iter) < 0)
+        HDONE_ERROR(H5E_DATASET, H5E_CANTFREE, FAIL, "unable to release chunk selection iterator");
+
     if (sel_iter)
         sel_iter = H5FL_FREE(H5S_sel_iter_t, sel_iter);
 
@@ -3730,6 +4757,29 @@ done:
 
     if (packed_buf)
         packed_buf = H5MM_xfree(packed_buf);
+
+    if (vl_tconv_buf)
+        vl_tconv_buf = H5MM_xfree(vl_tconv_buf);
+
+    if (vl_bkg_buf)
+        vl_bkg_buf = H5MM_xfree(vl_bkg_buf);
+
+    if (staged_heapset)
+        if (H5HG__free_local_heapset(staged_heapset) < 0)
+            HDONE_ERROR(H5E_HEAP, H5E_CANTFREE, FAIL, "unable to free staged chunk-local VL heap set");
+
+    if (old_heapset)
+        if (H5HG__free_local_heapset(old_heapset) < 0)
+            HDONE_ERROR(H5E_HEAP, H5E_CANTFREE, FAIL, "unable to free replaced chunk-local VL heap set");
+
+    if (staged_sel_space && H5S_close(staged_sel_space) < 0)
+        HDONE_ERROR(H5E_DATASPACE, H5E_CANTRELEASE, FAIL, "unable to release staged chunk selection");
+
+    if (old_sel_space && H5S_close(old_sel_space) < 0)
+        HDONE_ERROR(H5E_DATASPACE, H5E_CANTRELEASE, FAIL, "unable to release replaced chunk selection");
+
+    staged_data_buf = H5MM_xfree(staged_data_buf);
+    old_data_buf    = H5MM_xfree(old_data_buf);
 
     FUNC_LEAVE_NOAPI(ret_value)
 } /* H5D__struct_chunk_gather_mem() */
@@ -3757,6 +4807,21 @@ done:
  * NOTE: [io_type_info] not used??
  * NOTE: [udata] not used??
  *
+ * Updated:    Adds serial support for filling structured chunks containing
+ *             variable-length data.
+ *
+ *             For a VL datatype, the fixed-size descriptor buffer, selection,
+ *             and chunk-local heap set are constructed as staged replacement
+ *             state. They are installed in the chunk only after all fill
+ *             elements have been converted successfully. If construction
+ *             fails, the staged state is released and the existing chunk state
+ *             remains intact.
+ *
+ *             Each non-empty VL fill element is converted independently so
+ *             that every descriptor owns a distinct chunk-local heap object.
+ *             The chunk-local heap allocation is also included in the SCC
+ *
+ *                                          - AZO     09/16/26
  *-------------------------------------------------------------------------
  */
 static herr_t
@@ -3768,13 +4833,24 @@ H5D__struct_chunk_fill(H5D_dset_io_info_t *dset_info, H5D_io_type_info_t H5_ATTR
     H5D_chunk_cache_mem_t *chk  = (H5D_chunk_cache_mem_t *)chunk;              /* Chunk's memory cache info */
     uint8_t                elmt_buf[H5T_ELEM_BUF_SIZE];                        /* Buffer for element data */
     uint8_t                bkg_elmt_buf[H5T_ELEM_BUF_SIZE]; /* Buffer for background data */
-    size_t                 buf_size;
-    size_t                 src_type_size;
-    size_t                 dst_type_size;
-    size_t                 tot_buf_size;
-    htri_t                 has_vlen_type;
-    hsize_t                nelmts;
-    herr_t                 ret_value = SUCCEED; /* Return value		*/
+    H5T_t                 *chunk_file_type = NULL;  /* Chunk-file datatype using local VL references */
+    H5T_path_t            *chunk_tpath     = NULL;  /* Conversion path to the chunk-file datatype */
+    H5T_vlen_chunk_ctx_t   vl_ctx;                  /* Context used to create chunk-local VL objects */
+    H5HG_local_heapset_t  *staged_heapset   = NULL; /* New VL heap set retained until conversion succeeds */
+    H5HG_local_heapset_t  *old_heapset      = NULL; /* Replaced VL heap set awaiting release */
+    H5S_t                 *staged_sel_space = NULL; /* New selection retained until conversion succeeds */
+    H5S_t                 *old_sel_space    = NULL; /* Replaced selection awaiting release */
+    void   *staged_data_buf = NULL; /* New descriptor buffer retained until conversion succeeds */
+    void   *old_data_buf    = NULL; /* Replaced descriptor buffer awaiting release */
+    size_t  ref_nbytes      = 0;    /* Encoded size of one chunk-local VL reference */
+    size_t  buf_size;               /* Maximum source or destination element size */
+    size_t  src_type_size;          /* Size of one source fill element */
+    size_t  dst_type_size;          /* Size of one destination descriptor element */
+    size_t  tot_buf_size;           /* Total allocation required for the data buffer */
+    size_t  u;                      /* Fill element index */
+    htri_t  has_vlen_type;          /* Whether the destination datatype contains VL data */
+    hsize_t nelmts;                 /* Number of selected fill elements */
+    herr_t  ret_value = SUCCEED;    /* Return value */
 
     FUNC_ENTER_PACKAGE
 
@@ -3787,55 +4863,234 @@ H5D__struct_chunk_fill(H5D_dset_io_info_t *dset_info, H5D_io_type_info_t H5_ATTR
 
     buf_size = MAX(src_type_size, dst_type_size);
 
+    /* Detect whether the datatype has a VL component */
+    if ((has_vlen_type = H5T_detect_class(dset_info->dset->shared->type, H5T_VLEN, false)) < 0)
+        HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL, "unable to detect vlen datatypes?");
+
     nelmts = H5S_GET_SELECT_NPOINTS(space);
     H5_CHECK_OVERFLOW(nelmts, hsize_t, size_t);
 
-    tot_buf_size = nelmts * buf_size;
+    if (has_vlen_type) {
+        /*
+         * The resident buffer always stores dataset-file records.
+         *
+         * During a read, type_info.dst_type_size describes the application's
+         * memory datatype, which may be smaller than the file datatype.
+         * Using that size here would underallocate the default-fill buffer
+         * before scatter reads it using file-sized records.
+         */
+        if (0 == (dst_type_size = H5T_get_size(dset_info->dset->shared->type)))
+            HGOTO_ERROR(H5E_DATATYPE, H5E_BADSIZE, FAIL,
+                        "invalid file datatype size for structured chunk fill");
 
-    if (NULL == (chk->data_buf = H5MM_realloc(chk->data_buf, tot_buf_size)))
-        HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, FAIL, "memory reallocation failed for data buffer");
+        if ((size_t)nelmts > (SIZE_MAX / dst_type_size))
+            HGOTO_ERROR(H5E_RESOURCE, H5E_OVERFLOW, FAIL, "structured chunk VL fill buffer size overflow");
 
-    /* Detect whether the datatype has a VL component */
-    if ((has_vlen_type = H5T_detect_class(dset_info->type_info.src_type, H5T_VLEN, false)) < 0)
-        HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL, "unable to detect vlen datatypes?");
+        tot_buf_size = nelmts * dst_type_size;
 
-    if (fill->buf == NULL)
-        memset(chk->data_buf, 0, tot_buf_size);
-    else if (!has_vlen_type) { /* has fill value && not handling VL type yet */
+        /*
+         * Keep the new descriptor buffer separate from CHK until conversion
+         * succeeds. On failure, the current chunk remains unchanged.
+         */
+        if (NULL == (staged_data_buf = H5MM_malloc(tot_buf_size)))
+            HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, FAIL,
+                        "memory allocation failed for staged VL fill buffer");
 
-        void *elmt_ptr = elmt_buf;     /* Pointer to element to use for fill value */
-        void *bkg_ptr  = bkg_elmt_buf; /* Pointer to element to use for fill value */
+        if (NULL == fill->buf) {
+            /*
+             * A zero VL descriptor represents an empty value and requires no
+             * chunk-local heap object.
+             */
+            memset(staged_data_buf, 0, tot_buf_size);
+        }
+        else {
+            if (buf_size > H5T_ELEM_BUF_SIZE)
+                HGOTO_ERROR(H5E_DATASET, H5E_OVERFLOW, FAIL,
+                            "VL fill element exceeds conversion buffer size");
 
-        /* Copy the fill value to the buffer for conversion */
-        H5MM_memcpy(elmt_ptr, fill->buf, buf_size);
+            if (H5D__struct_chunk_prepare_vlen_type(dset_info->dset, dset_info->type_info.dst_type,
+                                                    dset_info->type_info.src_type, false, &chunk_file_type,
+                                                    &chunk_tpath, &ref_nbytes) < 0)
+                HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL,
+                            "unable to prepare chunk-local VL fill conversion");
 
-        /* Perform datatype conversion */
-        if (H5T_convert(dset_info->type_info.tpath, dset_info->type_info.src_type,
-                        dset_info->type_info.dst_type, (size_t)1, (size_t)0, (size_t)0, elmt_ptr,
-                        bkg_ptr) < 0)
-            HGOTO_ERROR(H5E_DATASET, H5E_CANTCONVERT, FAIL, "data type conversion failed");
+            memset(&vl_ctx, 0, sizeof(vl_ctx));
+            vl_ctx.f          = dset_info->dset->oloc.file;
+            vl_ctx.heapset    = &staged_heapset;
+            vl_ctx.ref_nbytes = ref_nbytes;
 
-        /* Replicate the fill value into the chunk buffer */
-        H5VM_array_fill(chk->data_buf, elmt_ptr, buf_size, (size_t)nelmts);
-    }
+            /*
+             * Convert each copy independently. Reusing one converted
+             * descriptor would make several elements reference the same
+             * uncounted heap object.
+             */
+            for (u = 0; u < (size_t)nelmts; u++) {
 
-    if (chk->sel_space) {
-        if (H5S_close(chk->sel_space) < 0)
-            HGOTO_ERROR(H5E_DATASET, H5E_CANTRELEASE, FAIL, "can't release dataspace");
-    }
+                memset(elmt_buf, 0, sizeof(elmt_buf));
+                memset(bkg_elmt_buf, 0, sizeof(bkg_elmt_buf));
 
-    if (NULL == (chk->sel_space = H5S_copy(space, false, true)))
-        HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "unable to get dataspace");
+                H5MM_memcpy(elmt_buf, fill->buf, src_type_size);
 
-    chk->data_nbytes = chk->data_alloc_size = tot_buf_size;
+                if (H5D__struct_chunk_vlen_convert(&vl_ctx, chunk_tpath, dset_info->type_info.src_type,
+                                                   chunk_file_type, (size_t)1, elmt_buf, bkg_elmt_buf) < 0)
+                    HGOTO_ERROR(H5E_DATASET, H5E_CANTCONVERT, FAIL, "chunk-local VL fill conversion failed");
 
-    /* Return values */
+                H5MM_memcpy((uint8_t *)staged_data_buf + (u * dst_type_size), elmt_buf, dst_type_size);
+            }
+        } /* end else */
+
+        /*
+         * Stage the matching selection as well. The selection, descriptor
+         * buffer, and heap set describe one logical chunk state and must be
+         * published together.
+         */
+        if (NULL == (staged_sel_space = H5S_copy(space, false, true)))
+            HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "unable to copy structured-chunk fill selection");
+
+        /*
+         * Save the old state for release after the new VL state has been
+         * installed. No fallible construction remains before publication.
+         */
+        old_sel_space = chk->sel_space;
+        old_data_buf  = chk->data_buf;
+        old_heapset   = chk->vl_heapset;
+
+        chk->sel_space       = staged_sel_space;
+        chk->data_buf        = staged_data_buf;
+        chk->vl_heapset      = staged_heapset;
+        chk->data_nbytes     = tot_buf_size;
+        chk->data_alloc_size = tot_buf_size;
+
+        staged_sel_space = NULL;
+        staged_data_buf  = NULL;
+        staged_heapset   = NULL;
+
+    } /* end if has_vlen */
+    else {
+        /*
+         * Preserve the original fixed-size fill behavior. BUF_SIZE is used as
+         * the conversion element width because it is the larger of the source
+         * and destination datatype sizes.
+         */
+
+        tot_buf_size = nelmts * buf_size;
+
+        if (NULL == (chk->data_buf = H5MM_realloc(chk->data_buf, tot_buf_size)))
+            HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, FAIL, "memory reallocation failed for data buffer");
+
+        if (fill->buf == NULL)
+            memset(chk->data_buf, 0, tot_buf_size);
+        else if (!has_vlen_type) { /* has fill value && not handling VL type yet */
+
+            void *elmt_ptr = elmt_buf;     /* Pointer to element to use for fill value */
+            void *bkg_ptr  = bkg_elmt_buf; /* Pointer to element to use for fill value */
+
+            /* Copy the fill value to the buffer for conversion */
+            H5MM_memcpy(elmt_ptr, fill->buf, buf_size);
+
+            /* Perform datatype conversion */
+            if (H5T_convert(dset_info->type_info.tpath, dset_info->type_info.src_type,
+                            dset_info->type_info.dst_type, (size_t)1, (size_t)0, (size_t)0, elmt_ptr,
+                            bkg_ptr) < 0)
+                HGOTO_ERROR(H5E_DATASET, H5E_CANTCONVERT, FAIL, "data type conversion failed");
+
+            /* Replicate the fill value into the chunk buffer */
+            H5VM_array_fill(chk->data_buf, elmt_ptr, buf_size, (size_t)nelmts);
+        }
+
+        if (chk->sel_space) {
+            if (H5S_close(chk->sel_space) < 0)
+                HGOTO_ERROR(H5E_DATASET, H5E_CANTRELEASE, FAIL, "can't release dataspace");
+
+            chk->sel_space = NULL;
+        }
+
+        if (NULL == (chk->sel_space = H5S_copy(space, false, true)))
+            HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "unable to copy structured-chunk fill selection");
+
+        chk->data_nbytes     = tot_buf_size;
+        chk->data_alloc_size = tot_buf_size;
+
+    } /* end else */
+
+    /* Report the fixed descriptor/data allocation updated by this callback. */
     *nbytes += chk->data_nbytes;
     *alloc_size += chk->data_alloc_size;
 
-    *alloc_size_total = chk->sel_alloc_size + chk->data_alloc_size;
+    /*
+     * Recalculate the complete SCC-resident allocation, including the
+     * chunk-local VL heap set.
+     */
+    if (H5D__struct_chunk_get_alloc_size(chk, alloc_size_total) < 0)
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL,
+                    "unable to determine structured chunk resident allocation");
+
+    /*
+     * The replacement is now complete. Release the old VL chunk state that
+     * was retained for rollback during construction.
+     */
+    if (old_sel_space) {
+        if (H5S_close(old_sel_space) < 0)
+            HDONE_ERROR(H5E_DATASPACE, H5E_CANTRELEASE, FAIL,
+                        "unable to release replaced structured-chunk selection");
+
+        old_sel_space = NULL;
+    }
+
+    old_data_buf = H5MM_xfree(old_data_buf);
+
+    if (old_heapset) {
+        if (H5HG__free_local_heapset(old_heapset) < 0)
+            HDONE_ERROR(H5E_HEAP, H5E_CANTFREE, FAIL, "unable to release replaced chunk-local VL heap set");
+
+        old_heapset = NULL;
+    }
 
 done:
+    if (chunk_file_type) {
+
+        if (H5T_close_real(chunk_file_type) < 0)
+            HDONE_ERROR(H5E_DATATYPE, H5E_CANTCLOSEOBJ, FAIL, "unable to close chunk-local VL fill datatype");
+    }
+
+    /*
+     * These objects remain non-NULL only when VL construction failed before
+     * publication.
+     */
+    if (staged_sel_space) {
+
+        if (H5S_close(staged_sel_space) < 0)
+            HDONE_ERROR(H5E_DATASPACE, H5E_CANTRELEASE, FAIL,
+                        "unable to release staged structured-chunk selection");
+    }
+
+    if (staged_data_buf) {
+        staged_data_buf = H5MM_xfree(staged_data_buf);
+    }
+
+    if (staged_heapset) {
+        if (H5HG__free_local_heapset(staged_heapset) < 0)
+            HDONE_ERROR(H5E_HEAP, H5E_CANTFREE, FAIL, "unable to release staged chunk-local VL heap set");
+    }
+
+    /*
+     * These remain non-NULL only if an error occurred after the new state was
+     * published but before the replaced state was completely released.
+     */
+    if (old_sel_space && H5S_close(old_sel_space) < 0)
+        HDONE_ERROR(H5E_DATASPACE, H5E_CANTRELEASE, FAIL,
+                    "unable to release replaced structured-chunk selection");
+
+    if (old_data_buf) {
+        old_data_buf = H5MM_xfree(old_data_buf);
+    }
+
+    if (old_heapset) {
+
+        if (H5HG__free_local_heapset(old_heapset) < 0)
+            HDONE_ERROR(H5E_HEAP, H5E_CANTFREE, FAIL, "unable to release replaced chunk-local VL heap set");
+    }
+
     FUNC_LEAVE_NOAPI(ret_value)
 
 } /* H5D__struct_chunk_fill() */
@@ -3944,20 +5199,38 @@ done:
  *
  * NOTE: chunk is pointer to the chunk intermediate struct
  *
- * NOTE: [udata] not used?? alloc_size not used??
+ * NOTE: [udata] not used??
+ *
+ * Updated:    Adds support for erasing structured-chunk elements that
+ *             contain variable-length data.
+ *
+ *             The fixed descriptor buffer and chunk-local VL heap set are
+ *             copied before modification. VL payloads referenced by erased
+ *             descriptors are recursively removed from the staged heap set,
+ *             and the surviving fixed records are compacted in the staged
+ *             buffer.
+ *
+ *             The staged buffer, selection, and heap set replace the existing
+ *             chunk state only after deletion, compaction, validation, and
+ *             resident-memory accounting succeed. Whole-chunk deletion
+ *             continues to rely on normal chunk eviction to release the
+ *             complete heap set.
+ *
+ *                                       -- AZO   09/16/26
  *-------------------------------------------------------------------------
  */
 static herr_t
 H5D__struct_chunk_erase_values(H5D_t *dset, const H5S_t *selection, size_t *nbytes /*in,out*/,
-                               size_t H5_ATTR_UNUSED *alloc_size /*in,out*/, void *chunk,
-                               bool *delete_chunk /*out*/, void H5_ATTR_UNUSED *udata)
+                               size_t *alloc_size /*in,out*/, void *chunk, bool *delete_chunk /*out*/,
+                               void H5_ATTR_UNUSED *udata)
 {
-    H5D_chunk_cache_mem_t  *chk = (H5D_chunk_cache_mem_t *)chunk; /* Chunk memory cache info */
-    void                   *buf = chk->data_buf;
-    H5S_t                  *serial_values_space = NULL;
-    H5S_t                  *serial_erase_space  = NULL;
-    H5S_t                  *new_space           = NULL;
-    H5_flexible_const_ptr_t flex_selection;
+    H5D_chunk_cache_mem_t *chk = (H5D_chunk_cache_mem_t *)chunk; /* Chunk memory cache info */
+    H5D_chunk_cache_mem_t  accounting_chk;                       /* Temporary staged accounting view */
+    void                  *buf = chk->data_buf;        /* Staged fixed-record buffer being compacted */
+    H5S_t                 *serial_values_space = NULL; /* Packed coordinate space for defined values */
+    H5S_t                 *serial_erase_space  = NULL; /* Erase selection in packed coordinates */
+    H5S_t                 *new_space           = NULL; /* Selection containing surviving values */
+    H5S_t                 *old_space           = NULL; /* Replaced defined-value selection */
 
     H5S_sel_iter_t *erase_iter      = NULL;
     bool            erase_iter_init = false;
@@ -3982,6 +5255,23 @@ H5D__struct_chunk_erase_values(H5D_t *dset, const H5S_t *selection, size_t *nbyt
     size_t   total_erased_bytes = 0;
     size_t   new_nelmts;
 
+    void *staged_data_buf = NULL; /* New data buffer retained until erase succeeds */
+    void *old_data_buf    = NULL; /* Replaced data buffer awaiting release */
+
+    H5HG_local_heapset_t *staged_vl_heapset = NULL; /* Heap-set copy modified during VL erase */
+    H5HG_local_heapset_t *old_vl_heapset    = NULL; /* Replaced heap set awaiting release */
+
+    H5T_t                      *chunk_file_type = NULL; /* File datatype using local VL references */
+    H5T_vlen_chunk_ctx_t        vl_ctx;                 /* Context for chunk-local VL deletion */
+    const H5T_vlen_chunk_ctx_t *old_vl_ctx = NULL;      /* Previously active VL context */
+    H5_flexible_const_ptr_t     flex_selection;
+
+    bool   vl_ctx_active  = false; /* Whether VL_CTX is currently installed */
+    htri_t has_vlen_type  = false; /* Whether the dataset datatype contains VL data */
+    htri_t heapset_empty  = false; /* Whether staged deletion removed every VL object */
+    size_t ref_nbytes     = 0;     /* Encoded size of one chunk-local VL reference */
+    size_t new_alloc_size = 0;     /* Resident allocation after the staged erase */
+
     herr_t ret_value = SUCCEED;
 
     FUNC_ENTER_PACKAGE
@@ -3990,6 +5280,8 @@ H5D__struct_chunk_erase_values(H5D_t *dset, const H5S_t *selection, size_t *nbyt
     assert(selection);
     assert(chunk);
     assert(delete_chunk);
+    assert(nbytes);
+    assert(alloc_size);
 
     *delete_chunk = false;
 
@@ -3997,17 +5289,6 @@ H5D__struct_chunk_erase_values(H5D_t *dset, const H5S_t *selection, size_t *nbyt
     if ((hss_nelmts = (hssize_t)H5S_GET_SELECT_NPOINTS(chk->sel_space)) < 0)
         HGOTO_ERROR(H5E_VFL, H5E_CANTCOUNT, FAIL, "can't get number of defined elements in chunk");
     H5_CHECKED_ASSIGN(chk_nelmts, hsize_t, hss_nelmts, hssize_t);
-
-    /* Number of elements requested to erase */
-    if ((hss_nelmts = (hssize_t)H5S_GET_SELECT_NPOINTS(selection)) < 0)
-        HGOTO_ERROR(H5E_VFL, H5E_CANTCOUNT, FAIL, "can't get number of elements selected for erase");
-    H5_CHECKED_ASSIGN(erase_nelmts, hsize_t, hss_nelmts, hssize_t);
-
-    /* If all defined values are being erased, delete the chunk */
-    if (chk_nelmts == erase_nelmts) {
-        *delete_chunk = true;
-        HGOTO_DONE(SUCCEED);
-    }
 
     if (0 == (elmt_size = H5T_get_size(dset->shared->type)))
         HGOTO_ERROR(H5E_DATATYPE, H5E_BADSIZE, FAIL, "datatype size invalid");
@@ -4037,6 +5318,52 @@ H5D__struct_chunk_erase_values(H5D_t *dset, const H5S_t *selection, size_t *nbyt
     if (projected_erase_nelmts == 0)
         HGOTO_DONE(SUCCEED);
 
+    /*
+     * Whole-chunk eviction releases the complete chunk-local heap set, so
+     * individual VL payloads do not need to be deleted here.
+     */
+    if (projected_erase_nelmts == chk_nelmts) {
+        *delete_chunk = true;
+        HGOTO_DONE(SUCCEED);
+    }
+
+    /*
+     * Determine whether erased fixed records can own chunk-local VL payloads.
+     */
+    if ((has_vlen_type = H5T_detect_class(dset->shared->type, H5T_VLEN, false)) < 0)
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "unable to determine whether datatype contains VL data");
+
+    if (chk_nbytes > chk->data_alloc_size)
+        HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL, "structured chunk data size exceeds its allocation");
+
+    /*
+     * This copies all currently used fixed records even when few values
+     * are erased. It keeps compaction off the resident buffer until the
+     * replacement selection, records, and heap set are ready to commit.
+     */
+    if (chk->data_alloc_size > 0) {
+
+        if (NULL == (staged_data_buf = H5MM_malloc(chk->data_alloc_size)))
+            HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, FAIL, "unable to allocate staged erase data buffer");
+
+        if (chk_nbytes > 0) {
+            H5MM_memcpy(staged_data_buf, chk->data_buf, chk_nbytes);
+        }
+    }
+
+    buf = staged_data_buf;
+
+    /*
+     * Copying the complete heap set also preserves payloads belonging to
+     * surviving descriptors during staged deletion. This is a correctness
+     * choice with a cost proportional to the copied heap set; selective
+     * staging is a possible later optimization.
+     */
+    if (has_vlen_type) {
+        if (H5HG__copy_local_heapset(dset->oloc.file, chk->vl_heapset, &staged_vl_heapset) < 0)
+            HGOTO_ERROR(H5E_HEAP, H5E_CANTCOPY, FAIL, "unable to copy chunk-local VL heap set for erase");
+    }
+
     erase_nelmts = projected_erase_nelmts;
 
     if (NULL == (erase_iter = H5FL_MALLOC(H5S_sel_iter_t)))
@@ -4057,6 +5384,38 @@ H5D__struct_chunk_erase_values(H5D_t *dset, const H5S_t *selection, size_t *nbyt
         HGOTO_ERROR(H5E_DATASET, H5E_CANTALLOC, FAIL, "can't allocate I/O offset vector array");
 
     /*
+     * Build a private disk-located datatype whose VL nodes use the
+     * chunk-local H5HG backend. This permits recursive deletion for VL values
+     * nested inside arrays, compounds, or other VL sequences.
+     */
+    if (has_vlen_type) {
+        if (H5D__struct_chunk_get_vlen_ref_size(dset, &ref_nbytes) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "unable to determine chunk-local VL reference width");
+
+        if (NULL == (chunk_file_type = H5T_copy(dset->shared->type, H5T_COPY_TRANSIENT)))
+            HGOTO_ERROR(H5E_DATATYPE, H5E_CANTCOPY, FAIL, "unable to copy file datatype for VL erase");
+
+        if (H5T_set_loc(chunk_file_type, H5F_VOL_OBJ(dset->oloc.file), H5T_LOC_DISK) < 0)
+            HGOTO_ERROR(H5E_DATATYPE, H5E_CANTINIT, FAIL, "unable to configure VL erase datatype");
+
+        if (H5T_get_size(chunk_file_type) != elmt_size)
+            HGOTO_ERROR(H5E_DATATYPE, H5E_BADSIZE, FAIL,
+                        "VL erase datatype has an unexpected file representation size");
+
+        if (H5T_patch_vlen_chunk_local(chunk_file_type, ref_nbytes) < 0)
+            HGOTO_ERROR(H5E_DATATYPE, H5E_CANTINIT, FAIL, "unable to install chunk-local VL erase backend");
+
+        memset(&vl_ctx, 0, sizeof(vl_ctx));
+
+        vl_ctx.f          = dset->oloc.file;
+        vl_ctx.heapset    = &staged_vl_heapset;
+        vl_ctx.ref_nbytes = ref_nbytes;
+
+        old_vl_ctx    = H5T_set_vlen_chunk_ctx(&vl_ctx);
+        vl_ctx_active = true;
+    }
+
+    /*
      * Compact the packed data buffer by copying surviving byte ranges
      * downward over erased byte ranges.
      */
@@ -4071,9 +5430,40 @@ H5D__struct_chunk_erase_values(H5D_t *dset, const H5S_t *selection, size_t *nbyt
             HGOTO_ERROR(H5E_INTERNAL, H5E_CANTGET, FAIL, "erase selection iterator made no progress");
 
         for (curr_seq = 0; curr_seq < nseq; curr_seq++) {
+            size_t seq_offset; /* Offset of one erased element within the sequence */
+
             H5_CHECKED_ASSIGN(src_off, size_t, off[curr_seq], hsize_t);
 
-            /* Copy surviving bytes before this erased sequence */
+            if ((src_off < prev_end_off) || (src_off > chk_nbytes) ||
+                (len[curr_seq] > (chk_nbytes - src_off)))
+                HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL,
+                            "erase sequence is outside the structured chunk data buffer");
+
+            if (len[curr_seq] % elmt_size)
+                HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL,
+                            "erase sequence is not aligned to datatype elements");
+
+            /*
+             * Release every VL payload owned by the erased fixed records
+             * before those records are compacted out of the staged buffer.
+             */
+            if (has_vlen_type) {
+
+                /*
+                 * Each removed VL object is passed to the heap backend separately.
+                 * H5HG__remove_local() compacts surviving payload bytes after each
+                 * removal, so erasing several objects can move heap contents repeatedly.
+                 * Batched deletion and compaction are deferred performance work.
+                 */
+                for (seq_offset = 0; seq_offset < len[curr_seq]; seq_offset += elmt_size) {
+
+                    if (H5T_vlen_delete_file_elmt((uint8_t *)buf + src_off + seq_offset, chunk_file_type) < 0)
+                        HGOTO_ERROR(H5E_DATATYPE, H5E_CANTREMOVE, FAIL,
+                                    "unable to delete erased chunk-local VL value");
+                }
+            }
+
+            /* Copy surviving bytes before this erased sequence. */
             if (src_off > prev_end_off) {
                 keep_bytes = src_off - prev_end_off;
                 if (dst_off != prev_end_off)
@@ -4083,10 +5473,43 @@ H5D__struct_chunk_erase_values(H5D_t *dset, const H5S_t *selection, size_t *nbyt
 
             /* Skip this erased sequence */
             prev_end_off = src_off + len[curr_seq];
+
+            if (len[curr_seq] > SIZE_MAX - total_erased_bytes)
+                HGOTO_ERROR(H5E_DATASET, H5E_OVERFLOW, FAIL, "erased byte count overflows size_t");
+
             total_erased_bytes += len[curr_seq];
-        }
+
+        } /* end for */
+
+        if ((hsize_t)nelem > erase_nelmts)
+            HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL, "erase iterator returned too many elements");
 
         erase_nelmts -= nelem;
+    } /* end while */
+
+    if (vl_ctx_active) {
+        H5T_set_vlen_chunk_ctx(old_vl_ctx);
+        vl_ctx_active = false;
+    }
+
+    /*
+     * Member heaps are freed as their final objects are removed, but H5HG
+     * deliberately retains the outer heap-set manager. Do not retain that
+     * empty manager as part of the resident chunk state.
+     */
+    if (has_vlen_type && staged_vl_heapset) {
+        if ((heapset_empty = H5HG__is_empty_local_heapset(staged_vl_heapset)) < 0)
+            HGOTO_ERROR(H5E_HEAP, H5E_CANTGET, FAIL,
+                        "unable to determine whether staged VL heap set is empty");
+
+        if (heapset_empty) {
+            H5HG_local_heapset_t *empty_heapset = staged_vl_heapset;
+
+            staged_vl_heapset = NULL;
+
+            if (H5HG__free_local_heapset(empty_heapset) < 0)
+                HGOTO_ERROR(H5E_HEAP, H5E_CANTFREE, FAIL, "unable to release empty staged VL heap set");
+        }
     }
 
     /* Copy trailing surviving bytes after the last erased sequence */
@@ -4101,7 +5524,7 @@ H5D__struct_chunk_erase_values(H5D_t *dset, const H5S_t *selection, size_t *nbyt
     if (dst_off < chk_nbytes)
         memset((uint8_t *)buf + dst_off, 0, chk_nbytes - dst_off);
 
-    chk->data_nbytes -= total_erased_bytes;
+    /* chk->data_nbytes -= total_erased_bytes; */
 
     {
         H5S_t  *full_chunk_space = NULL;
@@ -4168,16 +5591,90 @@ H5D__struct_chunk_erase_values(H5D_t *dset, const H5S_t *selection, size_t *nbyt
     }
 
     new_nelmts = (size_t)H5S_GET_SELECT_NPOINTS(new_space);
-    assert(chk->data_nbytes == (new_nelmts * elmt_size));
+    assert((chk_nbytes - total_erased_bytes) == (new_nelmts * elmt_size));
 
-    if (H5S_close(chk->sel_space) < 0)
-        HGOTO_ERROR(H5E_DATASET, H5E_CANTRELEASE, FAIL, "can't release old selection dataspace");
-    chk->sel_space = new_space;
-    new_space      = NULL;
+    /*
+     * Calculate SCC resident allocation against the staged heap set before
+     * publishing any part of the replacement state.
+     */
+    accounting_chk = *chk;
 
-    *nbytes = chk->data_nbytes;
+    if (has_vlen_type)
+        accounting_chk.vl_heapset = staged_vl_heapset;
+
+    if (H5D__struct_chunk_get_alloc_size(&accounting_chk, &new_alloc_size) < 0)
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL,
+                    "unable to determine structured chunk allocation after erase");
+
+    /*
+     * Commit the new selection, compacted fixed records, and VL heap set as
+     * one coherent structured-chunk state.
+     */
+    old_space    = chk->sel_space;
+    old_data_buf = chk->data_buf;
+
+    chk->sel_space   = new_space;
+    chk->data_buf    = staged_data_buf;
+    chk->data_nbytes = chk_nbytes - total_erased_bytes;
+
+    new_space       = NULL;
+    staged_data_buf = NULL;
+
+    if (has_vlen_type) {
+        old_vl_heapset    = chk->vl_heapset;
+        chk->vl_heapset   = staged_vl_heapset;
+        staged_vl_heapset = NULL;
+    }
+
+    *nbytes     = chk->data_nbytes;
+    *alloc_size = new_alloc_size;
+
+    /*
+     * The replacement state is now resident. Release the old state retained
+     * during staged construction.
+     */
+    if (old_space) {
+        if (H5S_close(old_space) < 0)
+            HDONE_ERROR(H5E_DATASPACE, H5E_CANTRELEASE, FAIL,
+                        "unable to release replaced defined-value selection");
+
+        old_space = NULL;
+    }
+
+    old_data_buf = H5MM_xfree(old_data_buf);
+
+    if (old_vl_heapset) {
+        if (H5HG__free_local_heapset(old_vl_heapset) < 0)
+            HDONE_ERROR(H5E_HEAP, H5E_CANTFREE, FAIL, "unable to release replaced chunk-local VL heap set");
+
+        old_vl_heapset = NULL;
+    }
 
 done:
+    if (vl_ctx_active) {
+        H5T_set_vlen_chunk_ctx(old_vl_ctx);
+    }
+
+    if (chunk_file_type) {
+
+        if (H5T_close_real(chunk_file_type) < 0)
+            HDONE_ERROR(H5E_DATATYPE, H5E_CANTCLOSEOBJ, FAIL,
+                        "unable to close chunk-local VL erase datatype");
+    }
+
+    if (old_space && H5S_close(old_space) < 0)
+        HDONE_ERROR(H5E_DATASPACE, H5E_CANTRELEASE, FAIL, "unable to release replaced selection");
+
+    if (old_data_buf) {
+        old_data_buf = H5MM_xfree(old_data_buf);
+    }
+
+    if (old_vl_heapset) {
+
+        if (H5HG__free_local_heapset(old_vl_heapset) < 0)
+            HDONE_ERROR(H5E_HEAP, H5E_CANTFREE, FAIL, "unable to release replaced chunk-local VL heap set");
+    }
+
     if (new_space && H5S_close(new_space) < 0)
         HDONE_ERROR(H5E_DATASPACE, H5E_CANTRELEASE, FAIL, "can't release new selection dataspace");
     if (erase_iter_init && H5S_SELECT_ITER_RELEASE(erase_iter) < 0)
@@ -4193,6 +5690,19 @@ done:
     if (off)
         off = H5FL_SEQ_FREE(hsize_t, off);
 
+    /*
+     * Non-NULL staged objects were never published, so failure cleanup can
+     * release them without changing the resident chunk.
+     */
+    if (staged_data_buf) {
+        staged_data_buf = H5MM_xfree(staged_data_buf);
+    }
+
+    if (staged_vl_heapset) {
+
+        if (H5HG__free_local_heapset(staged_vl_heapset) < 0)
+            HDONE_ERROR(H5E_HEAP, H5E_CANTFREE, FAIL, "unable to release staged erase heap set");
+    }
     FUNC_LEAVE_NOAPI(ret_value)
 } /* H5D__struct_chunk_erase_values() */
 
@@ -4210,33 +5720,102 @@ done:
  * NOTE: chunk is pointer to the chunk intermediate struct
  *
  * NOTE: [udata] not used??
+ *
+ * NOTE:        This callback implements value-only eviction while retaining
+ *              defined-value metadata. Registration in the callback table
+ *              does not establish that SCC currently invokes this path;
+ *              verify SCC wiring and test coverage before describing it
+ *              as exercised.
+ *
+ * Updated:     For structured chunks containing variable-length data, the
+ *              decoded chunk also owns a chunk-local H5HG heap set containing
+ *              the resident VL payloads. Value eviction now obtains the heap
+ *              set's cached allocation size, validates the SCC byte and
+ *              allocation accounting, and frees the heap set before freeing
+ *              the fixed-data buffer containing descriptors that reference it.
+ *
+ *              NBYTES is reduced only by DATA_NBYTES because decoded VL
+ *              payloads are not part of the packed logical section size.
+ *              ALLOC_SIZE is reduced by both DATA_ALLOC_SIZE and the resident
+ *              allocation owned by the chunk-local VL heap set.
+ *
+ *                                              -- AZO   9/18/26
  *-------------------------------------------------------------------------
  */
 static herr_t
 H5D__struct_chunk_evict_values(H5D_t *dset, size_t *nbytes /*in,out*/, size_t *alloc_size /*in,out*/,
                                void *chunk, void H5_ATTR_UNUSED *udata)
 {
-    H5D_chunk_cache_mem_t *chk = (H5D_chunk_cache_mem_t *)chunk; /* Chunk memory cache info */
+    H5D_chunk_cache_mem_t *chk                 = (H5D_chunk_cache_mem_t *)chunk; /* Chunk memory cache info */
+    size_t                 old_data_nbytes     = 0;
+    size_t                 old_data_alloc_size = 0;
+    size_t                 vl_alloc_size       = 0;
+    herr_t                 ret_value           = SUCCEED;
 
-    FUNC_ENTER_PACKAGE_NOERR
+    FUNC_ENTER_PACKAGE
 
-    /* Sanity check */
+    /* Sanity checks */
     assert(dset);
+    assert(nbytes);
+    assert(alloc_size);
+    assert(chunk);
 
-    size_t old_data_nbytes     = chk->data_nbytes;
-    size_t old_data_alloc_size = chk->data_alloc_size;
+    old_data_nbytes     = chk->data_nbytes;
+    old_data_alloc_size = chk->data_alloc_size;
 
+    /*
+     * Obtain the VL allocation before freeing the heap set. This is an O(1)
+     * cached query and is needed so SCC's resident allocation remains exact.
+     */
+    if (H5HG__get_local_heapset_alloc_size(chk->vl_heapset, &vl_alloc_size) < 0)
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "unable to get chunk-local VL allocation size");
+
+    /*
+     * Validate all accounting before changing the resident chunk.
+     */
+    if (*nbytes < old_data_nbytes)
+        HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL, "structured chunk resident byte count is inconsistent");
+
+    if (*alloc_size < old_data_alloc_size)
+        HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL,
+                    "structured chunk allocation accounting is inconsistent");
+
+    if (vl_alloc_size > (*alloc_size - old_data_alloc_size))
+        HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL,
+                    "structured chunk VL allocation accounting is inconsistent");
+
+    /*
+     * Release the chunk-local payload storage before clearing the fixed
+     * descriptors that reference it.
+     */
+    if (chk->vl_heapset) {
+        if (H5HG__free_local_heapset(chk->vl_heapset) < 0)
+            HGOTO_ERROR(H5E_HEAP, H5E_CANTFREE, FAIL, "unable to free chunk-local VL heap set");
+
+        chk->vl_heapset = NULL;
+    }
+
+    /* Release the packed fixed-value / descriptor buffer. */
     chk->data_buf        = H5MM_xfree(chk->data_buf);
     chk->data_nbytes     = 0;
     chk->data_alloc_size = 0;
 
-    assert(*nbytes >= old_data_nbytes);
-    assert(*alloc_size >= old_data_alloc_size);
-
+    /*
+     * NBYTES intentionally excludes decoded H5HG allocations. They are
+     * resident allocation rather than packed logical section bytes.
+     */
     *nbytes -= old_data_nbytes;
-    *alloc_size -= old_data_alloc_size;
 
-    FUNC_LEAVE_NOAPI(SUCCEED)
+    /*
+     * ALLOC_SIZE includes both the packed fixed buffer and the decoded VL
+     * heap set.
+     */
+    *alloc_size -= old_data_alloc_size;
+    *alloc_size -= vl_alloc_size;
+
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+
 } /* H5D__struct_chunk_evict_values() */
 
 /*-------------------------------------------------------------------------
@@ -4432,3 +6011,248 @@ done:
 
     FUNC_LEAVE_NOAPI(ret_value)
 } /* end H5D__struct_chunk_bh_info() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5D__struct_chunk_get_alloc_size
+ *
+ * Purpose:     Returns the resident allocation currently owned by a decoded
+ *              structured chunk.
+ *
+ *              The total includes the selection buffer, fixed-data buffer,
+ *              and any chunk-local VL heap-set allocation.
+ *
+ *              The VL heap-set size is obtained through the H5HG private
+ *              interface so the structured-chunk code does not depend on
+ *              the internal H5HG heap-set representation.
+ *
+ * Return:      SUCCEED/FAIL
+ *
+ *                                                  -- AZO    9/13/26
+ *
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5D__struct_chunk_get_alloc_size(const H5D_chunk_cache_mem_t *chk, size_t *alloc_size_out)
+{
+    size_t vl_alloc_size = 0;
+    size_t total         = 0;
+    herr_t ret_value     = SUCCEED;
+
+    FUNC_ENTER_PACKAGE
+
+    assert(chk);
+    assert(alloc_size_out);
+
+    *alloc_size_out = 0;
+
+    if ((chk->sel_alloc_size) > (SIZE_MAX - chk->data_alloc_size))
+        HGOTO_ERROR(H5E_DATASET, H5E_OVERFLOW, FAIL, "structured chunk resident allocation size overflow");
+
+    total = chk->sel_alloc_size + chk->data_alloc_size;
+
+    if (H5HG__get_local_heapset_alloc_size(chk->vl_heapset, &vl_alloc_size) < 0)
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "unable to get chunk-local VL allocation size");
+
+    if ((vl_alloc_size) > (SIZE_MAX - total))
+        HGOTO_ERROR(H5E_DATASET, H5E_OVERFLOW, FAIL, "structured chunk resident allocation size overflow");
+
+    total += vl_alloc_size;
+
+    *alloc_size_out = total;
+
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+
+} /* end H5D__struct_chunk_get_alloc_size() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5D__struct_chunk_get_vlen_ref_size
+ *
+ * Purpose:     Retrieves the reference-field width used by the normal
+ *              file-side VL descriptor for this file.
+ *
+ *              Chunk-local VL storage preserves the existing descriptor
+ *              width. The first four reference bytes are reinterpreted as
+ *              a 16-bit stable heap slot followed by a 16-bit H5HG object
+ *              index; any remaining bytes stay reserved.
+ *
+ * Return:      SUCCEED/FAIL
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5D__struct_chunk_get_vlen_ref_size(H5D_t *dset, size_t *ref_nbytes)
+{
+    H5VL_file_cont_info_t cont_info = {H5VL_CONTAINER_INFO_VERSION, 0, 0, 0};
+    H5VL_file_get_args_t  vol_cb_args;
+    herr_t                ret_value = SUCCEED;
+
+    FUNC_ENTER_PACKAGE
+
+    assert(dset);
+    assert(dset->oloc.file);
+    assert(ref_nbytes);
+
+    *ref_nbytes = 0;
+
+    memset(&vol_cb_args, 0, sizeof(vol_cb_args));
+
+    vol_cb_args.op_type                 = H5VL_FILE_GET_CONT_INFO;
+    vol_cb_args.args.get_cont_info.info = &cont_info;
+
+    /*
+     * Use the same container information that normal H5T VL disk setup uses
+     * when choosing the width of its file-side storage reference.
+     */
+    if (H5VL_file_get(H5F_VOL_OBJ(dset->oloc.file), &vol_cb_args, H5P_DATASET_XFER_DEFAULT, H5_REQUEST_NULL) <
+        0)
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "unable to retrieve file container information");
+
+    /*
+     * V1 needs at least four reference bytes:
+     * two for the stable heap slot and two for the H5HG object index.
+     */
+    if (cont_info.blob_id_size < 4)
+        HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL,
+                    "file VL reference field is too small for chunk-local encoding");
+
+    *ref_nbytes = cont_info.blob_id_size;
+
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+
+} /* end H5D__struct_chunk_get_vlen_ref_size() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5D__struct_chunk_prepare_vlen_type
+ *
+ * Purpose:     Creates an operation-local copy of the file-side datatype,
+ *              installs the chunk-local VL callback class on that copy,
+ *              and obtains the corresponding conversion path.
+ *
+ *              FILE_IS_SRC is true for reads and false for writes.
+ *
+ *              The shared dataset datatype is never modified.
+ *
+ * Return:      SUCCEED/FAIL
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5D__struct_chunk_prepare_vlen_type(H5D_t *dset, const H5T_t *file_type, const H5T_t *other_type,
+                                    bool file_is_src, H5T_t **chunk_file_type, H5T_path_t **chunk_tpath,
+                                    size_t *ref_nbytes)
+{
+    H5T_t *tmp_type  = NULL;
+    herr_t ret_value = SUCCEED;
+
+    FUNC_ENTER_PACKAGE
+
+    assert(dset);
+    assert(file_type);
+    assert(other_type);
+    assert(chunk_file_type);
+    assert(chunk_tpath);
+    assert(ref_nbytes);
+
+    *chunk_file_type = NULL;
+    *chunk_tpath     = NULL;
+    *ref_nbytes      = 0;
+
+    /*
+     * Recover the reference width already used by this file's ordinary
+     * file-side VL descriptors.
+     */
+    if (H5D__struct_chunk_get_vlen_ref_size(dset, ref_nbytes) < 0)
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "unable to determine chunk-local VL reference width");
+
+    /*
+     * Work only on a private copy. H5T_patch_vlen_chunk_local() recursively
+     * changes VL callback classes, so applying it to the shared dataset
+     * datatype would contaminate unrelated chunks and I/O operations.
+     */
+    if (NULL == (tmp_type = H5T_copy(file_type, H5T_COPY_TRANSIENT)))
+        HGOTO_ERROR(H5E_DATATYPE, H5E_CANTCOPY, FAIL,
+                    "unable to copy file datatype for chunk-local VL conversion");
+
+    if (H5T_set_loc(tmp_type, H5F_VOL_OBJ(dset->oloc.file), H5T_LOC_DISK) < 0)
+        HGOTO_ERROR(H5E_DATATYPE, H5E_CANTINIT, FAIL,
+                    "unable to configure private chunk datatype for disk storage");
+
+    if (H5T_get_size(tmp_type) != H5T_get_size(file_type))
+        HGOTO_ERROR(H5E_DATATYPE, H5E_BADSIZE, FAIL,
+                    "SCC conversion datatype does not have file-side layout");
+
+    if (H5T_patch_vlen_chunk_local(tmp_type, *ref_nbytes) < 0)
+        HGOTO_ERROR(H5E_DATATYPE, H5E_CANTINIT, FAIL, "unable to install chunk-local VL datatype backend");
+
+    /*
+     * H5T's conversion path must be found using the patched datatype.
+     * Reusing the path that was built for the ordinary blob-backed file
+     * datatype would defeat the purpose of changing the VL callback class.
+     */
+    if (file_is_src) {
+        if (NULL == (*chunk_tpath = H5T_path_find(tmp_type, other_type)))
+            HGOTO_ERROR(H5E_DATATYPE, H5E_CANTINIT, FAIL,
+                        "unable to create chunk-local VL read conversion path");
+    }
+    else {
+        if (NULL == (*chunk_tpath = H5T_path_find(other_type, tmp_type)))
+            HGOTO_ERROR(H5E_DATATYPE, H5E_CANTINIT, FAIL,
+                        "unable to create chunk-local VL write conversion path");
+    }
+
+    *chunk_file_type = tmp_type;
+    tmp_type         = NULL;
+
+done:
+    if (tmp_type)
+        if (H5T_close_real(tmp_type) < 0)
+            HDONE_ERROR(H5E_DATATYPE, H5E_CANTCLOSEOBJ, FAIL,
+                        "unable to release temporary chunk-local datatype");
+
+    FUNC_LEAVE_NOAPI(ret_value)
+
+} /* end H5D__struct_chunk_prepare_vlen_type() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5D__struct_chunk_vlen_convert
+ *
+ * Purpose:     Runs one datatype conversion while the supplied structured-
+ *              chunk VL context is active.
+ *
+ *              The previously active context is always restored before
+ *              returning, including when H5T_convert() fails.
+ *
+ * Return:      SUCCEED/FAIL
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5D__struct_chunk_vlen_convert(const H5T_vlen_chunk_ctx_t *ctx, H5T_path_t *tpath, const H5T_t *src_type,
+                               const H5T_t *dst_type, size_t nelmts, void *buf, void *bkg)
+{
+    const H5T_vlen_chunk_ctx_t *old_ctx   = NULL;
+    herr_t                      ret_value = SUCCEED;
+
+    FUNC_ENTER_PACKAGE
+
+    assert(ctx);
+    assert(tpath);
+    assert(src_type);
+    assert(dst_type);
+    assert(buf);
+
+    /*
+     * The context is intentionally active only while H5T is interpreting
+     * chunk-local VL descriptors.
+     */
+    old_ctx = H5T_set_vlen_chunk_ctx(ctx);
+
+    if (H5T_convert(tpath, src_type, dst_type, nelmts, (size_t)0, (size_t)0, buf, bkg) < 0)
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTCONVERT, FAIL, "chunk-local VL datatype conversion failed");
+
+done:
+    /* Always restore the previous context, including nested callers. */
+    H5T_set_vlen_chunk_ctx(old_ctx);
+
+    FUNC_LEAVE_NOAPI(ret_value)
+
+} /* end H5D__struct_chunk_vlen_convert() */
